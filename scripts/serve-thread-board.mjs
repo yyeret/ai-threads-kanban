@@ -1,0 +1,695 @@
+#!/usr/bin/env node
+// Fast local web board for the AI thread registry.
+//   node serve-thread-board.mjs [--port 7878]
+// Opens http://127.0.0.1:7878 — threads grouped by stage, filterable by intent
+// area, with one click to continue a session in a terminal or review its log.
+// Binds to localhost only.
+
+import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawn, execFileSync } from "node:child_process";
+import { resolveRegistryDir } from "./lib/paths.mjs";
+
+const home = os.homedir();
+const args = parseArgs(process.argv.slice(2));
+const port = Number(args.port || process.env.THREAD_BOARD_PORT || 7878);
+const dir = resolveRegistryDir();
+const registryPath = path.join(dir, "active-threads.jsonl");
+const scriptDir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+
+// Kanban lanes, left to right. Funnel/Triage is the muted holding lane for
+// already-started threads not yet clearly worth tracking; Done is muted at the
+// far right; the middle is the committed Specify -> Review flow.
+const STAGE_ORDER = [
+  "Funnel / Triage", "On Hold", "Specify", "Plan", "Implement", "Review / Ship",
+  "Done / Archive Candidates",
+];
+const LIST_ORDER = STAGE_ORDER;
+const MUTED_STAGES = new Set(["Funnel / Triage", "On Hold", "Done / Archive Candidates"]);
+
+const server = http.createServer((req, res) => {
+  try {
+    const url = new URL(req.url, `http://127.0.0.1:${port}`);
+    if (url.pathname === "/") return sendHtml(res, renderBoard(url.searchParams.get("area")));
+    if (url.pathname === "/kanban") return sendHtml(res, renderKanban(url.searchParams.get("area")));
+    if (url.pathname === "/kanban-ipsum") return sendHtml(res, renderKanban(null, true));
+    if (url.pathname === "/continue") return handleContinue(res, url.searchParams.get("id"), url.searchParams.get("step"));
+    if (url.pathname === "/log") return handleLog(res, url.searchParams.get("id"));
+    if (url.pathname === "/card") return handleCard(res, url.searchParams.get("id"));
+    if (url.pathname === "/refresh") return handleRefresh(res);
+    if (url.pathname === "/set-stage") return handleSetStage(res, url.searchParams.get("id"), url.searchParams.get("stage"));
+    res.writeHead(404).end("Not found");
+  } catch (err) {
+    res.writeHead(500).end(`Error: ${err.message}`);
+  }
+});
+
+server.listen(port, "127.0.0.1", () => {
+  console.log(`AI thread board: http://127.0.0.1:${port}`);
+});
+
+// --- routes ----------------------------------------------------------------
+
+function handleContinue(res, id, withStep) {
+  const t = findThread(id);
+  if (!t) return res.writeHead(404).end("Thread not found");
+  const session = (t.sessions || [])[0];
+  if (!session || !session.resume) return res.writeHead(400).end("No resume command for this thread");
+  const ok = openTerminal(session.cwd || home, session.resume);
+  // "Continue with next action" also puts the suggested step on the clipboard.
+  if (withStep && t.next_step) copyToClipboard(t.next_step);
+  res.writeHead(303, { Location: "/" }).end(ok ? "" : "Could not open a terminal");
+}
+
+function copyToClipboard(text) {
+  try {
+    const p = spawn("clip", { stdio: ["pipe", "ignore", "ignore"] });
+    p.stdin.write(text);
+    p.stdin.end();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function handleCard(res, id) {
+  const t = findThread(id);
+  if (!t) return res.writeHead(404).end("Thread not found");
+  sendHtml(res, renderCard(t));
+}
+
+function handleLog(res, id) {
+  const t = findThread(id);
+  if (!t) return res.writeHead(404).end("Thread not found");
+  const session = (t.sessions || [])[0];
+  if (!session || !session.transcript_path || !fs.existsSync(session.transcript_path)) {
+    return sendHtml(res, `<p>No transcript on disk for this thread.</p><p><a href="/">&larr; board</a></p>`);
+  }
+  sendHtml(res, renderLog(t, session));
+}
+
+function handleSetStage(res, id, stage) {
+  if (!id || !stage || !STAGE_ORDER.includes(stage)) {
+    return res.writeHead(400).end("bad request");
+  }
+  const records = loadRegistry();
+  const t = records.find((r) => r.thread_id === id);
+  if (!t) return res.writeHead(404).end("thread not found");
+  t.manual_stage = stage;
+  t.stage = stage;
+  // Moving a thread is a touch — reset the idle clock from now.
+  t.stage_changed_at = new Date().toISOString();
+  t.updated_at = t.stage_changed_at;
+  // Mirror edit-thread.mjs --finish: dropping a card onto Done marks it
+  // finished, which is the gate apply-thread-names uses to archive the
+  // Codex rollout. Moving away from Done clears that flag so it isn't
+  // archived on the next refresh.
+  if (stage === "Done / Archive Candidates") {
+    t.manual_status = "done";
+    t.manual_tracking = "archive";
+  } else if (t.manual_status === "done") {
+    delete t.manual_status;
+    if (t.manual_tracking === "archive") delete t.manual_tracking;
+  }
+  fs.writeFileSync(registryPath, records.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+  // Re-render the board and re-stamp harness session names with the new stage.
+  try {
+    execFileSync(process.execPath, [path.join(scriptDir, "reconcile-threads.mjs")], { stdio: "ignore" });
+    execFileSync(process.execPath, [path.join(scriptDir, "apply-thread-names.mjs")], { stdio: "ignore" });
+  } catch {
+    /* registry write already succeeded; board still reflects the change */
+  }
+  res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
+}
+
+function handleRefresh(res) {
+  try {
+    execFileSync(process.execPath, [path.join(scriptDir, "scan-session-history.mjs"), "--days", "30"], { stdio: "ignore" });
+    execFileSync(process.execPath, [path.join(scriptDir, "reconcile-threads.mjs")], { stdio: "ignore" });
+  } catch {
+    /* ignore — board still serves the last good registry */
+  }
+  res.writeHead(303, { Location: "/" }).end();
+}
+
+// --- terminal launch -------------------------------------------------------
+
+function openTerminal(cwd, command) {
+  const useDir = cwd && fs.existsSync(cwd) ? cwd : home;
+  // Prefer Windows Terminal; fall back to a detached cmd window.
+  for (const attempt of [
+    () => spawn("wt.exe", ["-d", useDir, "cmd", "/k", command], { detached: true, stdio: "ignore" }),
+    () => spawn("cmd.exe", ["/c", "start", "cmd", "/k", `cd /d "${useDir}" && ${command}`], { detached: true, stdio: "ignore" }),
+  ]) {
+    try {
+      const child = attempt();
+      child.unref();
+      return true;
+    } catch {
+      /* try next */
+    }
+  }
+  return false;
+}
+
+// --- rendering -------------------------------------------------------------
+
+function chipBar(all, areaFilter, basePath) {
+  const areas = [...new Set(all.map((t) => t.intent_area || "Other / Unsorted"))].sort();
+  const q = (a) => (a ? `${basePath}?area=${encodeURIComponent(a)}` : basePath);
+  return [
+    `<a class="chip${areaFilter ? "" : " on"}" href="${basePath}">All (${all.length})</a>`,
+    ...areas.map((a) => {
+      const n = all.filter((t) => t.intent_area === a).length;
+      return `<a class="chip${areaFilter === a ? " on" : ""}" href="${q(a)}">${esc(a)} (${n})</a>`;
+    }),
+  ].join("");
+}
+
+function nav(active) {
+  const link = (href, label) => `<a class="${active === href ? "navon" : ""}" href="${href}">${label}</a>`;
+  return `<div class="nav">${link("/", "List view")} ${link("/kanban", "Kanban view")}
+    ${link("/kanban-ipsum", "Shareable")} ·
+    <a href="/refresh">refresh now</a></div>`;
+}
+
+function renderBoard(areaFilter) {
+  const all = visibleThreads(loadRegistry());
+  const threads = areaFilter ? all.filter((t) => t.intent_area === areaFilter) : all;
+
+  // Reverse flow order — Done at the top, Funnel at the bottom — so the eye
+  // lands on finishing before starting. Done starts collapsed.
+  const sections = [...LIST_ORDER].reverse().map((stage) => {
+    const items = threads
+      .filter((t) => t.stage === stage)
+      .sort((a, b) => (b.staleness_hours || 0) - (a.staleness_hours || 0));
+    if (!items.length) return "";
+    const open = stage === "Done / Archive Candidates" ? "" : " open";
+    return `<details class="stage-sec"${open}>
+      <summary><span class="stage-name">${esc(stage)}</span> <span class="count">${items.length}</span></summary>
+      <div class="stage-body">${items.map(renderCard).join("")}</div>
+    </details>`;
+  }).join("");
+
+  return page("AI Thread Board", `
+    <header>
+      <h1>AI Thread Board</h1>
+      ${nav("/")}
+      <div class="meta">${threads.length} threads${areaFilter ? ` in ${esc(areaFilter)}` : ""} · auto-refreshes every 60s</div>
+    </header>
+    <div class="chips">${chipBar(all, areaFilter, "/")}</div>
+    ${sections || "<p>No threads.</p>"}
+  `);
+}
+
+function renderKanban(areaFilter, ipsum) {
+  const all = visibleThreads(loadRegistry());
+  const threads = (areaFilter && !ipsum) ? all.filter((t) => t.intent_area === areaFilter) : all;
+
+  const lanes = STAGE_ORDER.map((stage) => {
+    const items = threads
+      .filter((t) => t.stage === stage)
+      .sort((a, b) => (b.staleness_hours || 0) - (a.staleness_hours || 0));
+    const muted = MUTED_STAGES.has(stage);
+    const cards = items.map((t) => {
+      const title = ipsum ? loremTitle(t) : (t.display_title || t.title);
+      let tip = ipsum ? esc(ageLabel(t)) : `${esc(t.intent_area || "")} — ${esc(ageLabel(t))}`;
+      if (!ipsum && t.next_step) tip += ` — Next: ${esc(t.next_step)}`;
+      const blk = (!ipsum && t.blocked) ? '<span class="blk">BLOCKED</span> ' : "";
+      const drag = ipsum ? "" : ` draggable="true" data-id="${t.thread_id}"`;
+      const s0 = (t.sessions || [])[0] || {};
+      let acts = "";
+      if (!ipsum) {
+        const a = [];
+        if (s0.resume) {
+          a.push(`<a class="mini-act" data-fetch href="/continue?id=${t.thread_id}" title="Continue this session" draggable="false">&#9654;</a>`);
+          if (t.next_step) {
+            a.push(`<a class="mini-act act-next" data-fetch href="/continue?id=${t.thread_id}&step=1" title="Continue with next action — also copies the suggested next step: ${esc(t.next_step)}" draggable="false">&#9197;</a>`);
+          }
+        }
+        if (s0.transcript_path) {
+          a.push(`<a class="mini-act" href="/log?id=${t.thread_id}" title="Review the session log" draggable="false">&#128196;</a>`);
+        }
+        if (a.length) acts = `<span class="mini-acts">${a.join("")}</span>`;
+      }
+      return `
+      <div class="mini${t.aging ? " mini-aging" : ""}${t.blocked ? " mini-blocked" : ""}${ipsum ? "" : " mini-open"}"${drag}
+         style="border-left-color:${areaColor(t.intent_area)}" title="${tip}">
+        <span class="mini-title">${esc(truncate(title, 90))}</span>
+        <span class="mini-foot">
+          <span class="mini-meta">${blk}${agePill(t)} <span class="mini-dim">${(t.harnesses || []).join("/")}</span></span>
+          ${acts}
+        </span>
+      </div>`;
+    }).join("");
+    return `<div class="lane${muted ? " lane-muted" : ""}" data-stage="${esc(stage)}">
+      <div class="lane-head">${esc(stage.split(" / ")[0])} <span class="count">${items.length}</span></div>
+      <div class="lane-body">${cards || '<div class="lane-empty">—</div>'}</div>
+    </div>`;
+  }).join("");
+
+  if (ipsum) {
+    return page("Thread Board — Shareable", `
+      <header>
+        <h1>Thread Board <span class="dim">(shareable view)</span></h1>
+        ${nav("/kanban-ipsum")}
+        <div class="meta">${threads.length} threads · card titles obfuscated — safe to screenshot</div>
+      </header>
+      <div class="board">${lanes}</div>
+    `);
+  }
+  return page("AI Thread Board — Kanban", `
+    <header>
+      <h1>AI Thread Board — Kanban</h1>
+      ${nav("/kanban")}
+      <div class="meta">${threads.length} threads${areaFilter ? ` in ${esc(areaFilter)}` : ""} ·
+        drag a card to another lane to change its stage</div>
+    </header>
+    <div class="chips">${chipBar(all, areaFilter, "/kanban")}</div>
+    <div class="board" id="board">${lanes}</div>
+    <div id="modal" class="modal-overlay" hidden>
+      <div class="modal-box">
+        <button class="modal-close" aria-label="Close">&times;</button>
+        <div id="modal-body"></div>
+      </div>
+    </div>
+    ${DRAG_SCRIPT}
+  `);
+}
+
+const DRAG_SCRIPT = `<script>
+(function () {
+  var board = document.getElementById("board");
+  if (!board) return;
+  var dragId = null;
+  var modal = document.getElementById("modal");
+  var modalBody = document.getElementById("modal-body");
+
+  // Fire a continue/log action link in place — fetch, flash, no navigation.
+  function fireAction(link) {
+    link.style.opacity = "0.35";
+    fetch(link.getAttribute("href"))
+      .then(function () { link.style.opacity = "1"; link.classList.add("act-fired"); })
+      .catch(function () { link.style.opacity = "1"; });
+  }
+  function closeModal() { modal.hidden = true; modalBody.innerHTML = ""; }
+  function openModal(id) {
+    fetch("/card?id=" + encodeURIComponent(id))
+      .then(function (r) { return r.text(); })
+      .then(function (html) { modalBody.innerHTML = html; modal.hidden = false; });
+  }
+
+  board.addEventListener("click", function (e) {
+    var act = e.target.closest(".mini-act[data-fetch]");
+    if (act) { e.preventDefault(); fireAction(act); return; }
+    if (e.target.closest(".mini-act")) return; // log link — navigate normally
+    var card = e.target.closest(".mini[data-id]");
+    if (card) openModal(card.getAttribute("data-id"));
+  });
+
+  // Modal: backdrop / close button dismiss; continue links fire in place.
+  modal.addEventListener("click", function (e) {
+    if (e.target === modal || e.target.closest(".modal-close")) { closeModal(); return; }
+    var cont = e.target.closest('a[href^="/continue"]');
+    if (cont) { e.preventDefault(); fireAction(cont); }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && !modal.hidden) closeModal();
+  });
+
+  board.addEventListener("dragstart", function (e) {
+    var card = e.target.closest(".mini[data-id]");
+    if (!card) return;
+    dragId = card.getAttribute("data-id");
+    e.dataTransfer.effectAllowed = "move";
+  });
+  board.addEventListener("dragover", function (e) {
+    if (e.target.closest(".lane")) { e.preventDefault(); }
+  });
+  board.addEventListener("dragenter", function (e) {
+    var lane = e.target.closest(".lane");
+    if (lane) lane.classList.add("lane-over");
+  });
+  board.addEventListener("dragleave", function (e) {
+    var lane = e.target.closest(".lane");
+    if (lane && !lane.contains(e.relatedTarget)) lane.classList.remove("lane-over");
+  });
+  board.addEventListener("drop", function (e) {
+    var lane = e.target.closest(".lane");
+    if (!lane || !dragId) return;
+    e.preventDefault();
+    lane.classList.remove("lane-over");
+    var stage = lane.getAttribute("data-stage");
+    board.style.opacity = "0.5";
+    fetch("/set-stage?id=" + encodeURIComponent(dragId) + "&stage=" + encodeURIComponent(stage))
+      .then(function (r) { location.reload(); })
+      .catch(function () { board.style.opacity = "1"; });
+    dragId = null;
+  });
+})();
+</script>`;
+
+// Deterministic placeholder title for a thread — stable across refreshes,
+// roughly the word count of the real title, carrying no real content.
+const LOREM = [
+  "lorem", "ipsum", "dolor", "sit", "amet", "consectetur", "adipiscing", "elit",
+  "sed", "tempor", "labore", "magna", "aliqua", "veniam", "nostrud", "ullamco",
+  "laboris", "aliquip", "commodo", "consequat", "aute", "irure", "voluptate",
+  "cillum", "fugiat", "nulla", "pariatur", "proident", "officia", "deserunt",
+];
+
+function loremTitle(t) {
+  let seed = 0;
+  for (const ch of String(t.thread_id || t.title || "x")) seed = (seed * 31 + ch.charCodeAt(0)) >>> 0;
+  const realWords = String(t.display_title || t.title || "").trim().split(/\s+/).length;
+  const count = Math.max(3, Math.min(8, realWords));
+  const words = [];
+  for (let i = 0; i < count; i += 1) {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    words.push(LOREM[seed % LOREM.length]);
+  }
+  return words.join(" ").replace(/^./, (c) => c.toUpperCase());
+}
+
+function areaColor(area) {
+  const palette = {
+    "LinkedIn & Prospecting": "#2563eb",
+    "CRM & Pipeline Data": "#0891b2",
+    "Content & Publishing": "#16a34a",
+    "Podcast": "#9333ea",
+    "Thought Leadership & POV": "#c026d3",
+    "Skill Library & Agent Infra": "#ea580c",
+    "Site & Web": "#0d9488",
+    "Meetings & Clients": "#ca8a04",
+    "Job Search": "#dc2626",
+    "Sales & Proposals": "#65a30d",
+  };
+  return palette[area] || "#94a3b8";
+}
+
+function renderCard(t) {
+  const s = (t.sessions || [])[0] || {};
+  const aging = t.aging ? ` <span class="badge aging">&#9888; AGING &middot; ${esc(ageLabel(t))}</span>` : "";
+  const blocked = t.blocked ? ' <span class="badge blocked">&#9209; BLOCKED</span>' : "";
+  const harness = (t.harnesses || []).join(", ");
+  const logLink = s.transcript_path
+    ? `<a class="btn" href="/log?id=${t.thread_id}">&#128196; log</a>
+       <a class="btn ghost" href="vscode://file/${encodeURI(s.transcript_path.replace(/\\/g, "/"))}">open in editor</a>`
+    : "";
+  const continueBtn = s.resume
+    ? `<a class="btn go" href="/continue?id=${t.thread_id}${t.next_step ? "&step=1" : ""}" title="${t.next_step ? "Opens the session and copies the next-step prompt to your clipboard" : "Resume this session"}">&#9654; continue${t.next_step ? " + copy step" : ""}</a>`
+    : "";
+  const nextStep = t.next_step
+    ? `<div class="nextstep"><span class="ns-label">&#9654; Next step</span> ${esc(t.next_step)}</div>`
+    : "";
+  return `
+    <div class="card${t.aging ? " is-aging" : ""}" id="t-${t.thread_id}">
+      <div class="card-head">
+        <span class="title">${esc(t.display_title || t.title)}</span>${blocked}${aging}
+        <span class="badge area">${esc(t.intent_area || "Other / Unsorted")}</span>
+      </div>
+      <div class="intent">${esc(truncate(t.outcome_intent, 240))}</div>
+      <div class="standing">${esc(t.status || "")} — ${esc(truncate(t.where_it_stands || "", 160))}</div>
+      ${t.notes ? `<div class="notes">note: ${esc(t.notes)}</div>` : ""}
+      ${nextStep}
+      <div class="card-foot">
+        <span class="dim">${agePill(t)} ${esc(harness)} · ${esc(t.repo_key || "")}${t.session_count > 1 ? ` · ${t.session_count} sessions` : ""}</span>
+        <span class="actions">${continueBtn}${logLink}</span>
+      </div>
+    </div>`;
+}
+
+function renderLog(t, session) {
+  // Preamble is already stripped by readTranscript. Show the head (where the
+  // real conversation starts — the intent) and the tail (where it stands),
+  // collapsing the middle so the log is readable without the overhead.
+  const all = readTranscript(session.transcript_path);
+  const HEAD = 5;
+  const TAIL = 8;
+  let shown;
+  let omitted = 0;
+  if (all.length <= HEAD + TAIL) {
+    shown = all;
+  } else {
+    omitted = all.length - HEAD - TAIL;
+    shown = [...all.slice(0, HEAD), { gap: omitted }, ...all.slice(-TAIL)];
+  }
+  const body = shown.map((m) => {
+    if (m.gap) {
+      return `<div class="log-gap">— ${m.gap} messages hidden · open the raw transcript for the full thread —</div>`;
+    }
+    return `<div class="msg ${m.role}">
+      <div class="role">${esc(m.role)}</div>
+      <div class="text">${esc(clip(m.text, 1800))}</div>
+    </div>`;
+  }).join("");
+  const note = omitted
+    ? `head + tail — first ${HEAD}, last ${TAIL}, ${omitted} middle hidden · preamble trimmed`
+    : `${all.length} messages · preamble trimmed`;
+  return page(`Log — ${t.title}`, `
+    <header>
+      <h1>${esc(t.display_title || t.title)}</h1>
+      <div class="meta">${esc(session.harness)} · ${esc(t.repo_key || "")} · ${esc(note)} ·
+        <a href="/">&larr; board</a> ·
+        <a href="vscode://file/${encodeURI(session.transcript_path.replace(/\\/g, "/"))}">open raw transcript</a></div>
+    </header>
+    <div class="log">${body || "<p>No readable messages.</p>"}</div>
+  `);
+}
+
+// --- transcript parsing ----------------------------------------------------
+
+// Injected-context prefixes — messages that are harness preamble, not the
+// user's actual conversation (instruction blocks, IDE context, slash commands).
+const PREAMBLE_PREFIXES = [
+  "<environment", "<local-command", "<ide_opened_file", "<ide_selection",
+  "<system-reminder", "<command-name", "<command-message", "<command-args",
+  "<permissions", "<user_instructions", "<user-instructions",
+  "# agents.md instructions", "# claude.md", "# context from my ide setup",
+  "# files mentioned by the user",
+];
+
+// Real content of a user message, or null if the message is pure preamble.
+function messageContent(text) {
+  let s = String(text || "").trim();
+  // A real request wrapped in IDE/files context — take the request itself.
+  const marker = s.match(/##\s*my request(?: for [a-z]+)?\s*:?\s*/i);
+  if (marker) s = s.slice(marker.index + marker[0].length).trim();
+  if (!s) return null;
+  const lc = s.toLowerCase();
+  if (PREAMBLE_PREFIXES.some((p) => lc.startsWith(p))) return null;
+  // Any opening tag whose name ends in "instruction(s)" — <permissions
+  // instructions>, <user instructions>, <instructions>, etc.
+  if (/^<[\w -]*instructions?\b/i.test(s)) return null;
+  if (lc.includes("<instructions>") && s.length > 400) return null;
+  return s;
+}
+
+function clip(s, n) {
+  return s.length > n ? `${s.slice(0, n)}\n…[truncated]` : s;
+}
+
+function readTranscript(file) {
+  const out = [];
+  for (const line of readLines(file)) {
+    let o;
+    try { o = JSON.parse(line); } catch { continue; }
+    const m = extractMessage(o);
+    if (!m || !m.text) continue;
+    if (m.role === "user") {
+      const content = messageContent(m.text);
+      if (!content) continue; // injected preamble — drop it
+      m.text = content;
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+function extractMessage(o) {
+  // Claude
+  if (o.type === "user" && o.message?.content) return { role: "user", text: flatten(o.message.content) };
+  if (o.type === "assistant" && o.message?.content) return { role: "assistant", text: flatten(o.message.content) };
+  // Codex
+  if (o.type === "response_item" && o.payload?.type === "message") {
+    const role = o.payload.role === "assistant" ? "assistant" : "user";
+    return { role, text: flatten(o.payload.content) };
+  }
+  if (o.type === "event_msg" && o.payload?.type === "agent_message") {
+    return { role: "assistant", text: String(o.payload.message || "") };
+  }
+  // Gemini
+  if (o.type === "user" && o.content) return { role: "user", text: flatten(o.content) };
+  if ((o.type === "gemini" || o.type === "model") && o.content) return { role: "assistant", text: flatten(o.content) };
+  return null;
+}
+
+function flatten(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((p) => (typeof p === "string" ? p : p.text || p.content || "")).filter(Boolean).join(" ");
+  }
+  return "";
+}
+
+// --- helpers ---------------------------------------------------------------
+
+function loadRegistry() {
+  return readLines(registryPath)
+    .flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } })
+    .sort((a, b) => Date.parse(b.last_activity || 0) - Date.parse(a.last_activity || 0));
+}
+
+function findThread(id) {
+  if (!id) return null;
+  return loadRegistry().find((t) => t.thread_id === id) || null;
+}
+
+function ageLabel(t) {
+  if (t.staleness_hours == null) return "age unknown";
+  const h = t.staleness_hours;
+  return h < 48 ? `${h}h idle` : `${Math.round(h / 24)}d idle`;
+}
+
+// Severity tier for idle time: aging = past the stage SLE, warm = >2 days
+// idle, fresh otherwise. Drives the colour of the idle pill.
+function staleTier(t) {
+  if (t.aging) return "aging";
+  return (t.staleness_hours || 0) > 48 ? "warm" : "fresh";
+}
+
+function agePill(t) {
+  // Idle time is meaningless once a thread is done.
+  if (t.stage === "Done / Archive Candidates") return "";
+  return `<span class="age age-${staleTier(t)}">${esc(ageLabel(t))}</span>`;
+}
+
+// Hide threads that have been done for more than 14 days — long-archived noise.
+function visibleThreads(threads) {
+  const cutoffHours = 14 * 24;
+  return threads.filter((t) => !(
+    t.stage === "Done / Archive Candidates" && (t.staleness_hours || 0) > cutoffHours
+  ));
+}
+
+function readLines(file) {
+  if (!file || !fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8").split(/\r?\n/).filter((l) => l.trim());
+}
+
+function truncate(text, n) {
+  const c = String(text || "").replace(/\s+/g, " ").trim();
+  return c.length > n ? `${c.slice(0, n - 3)}...` : c;
+}
+
+function esc(text) {
+  return String(text || "").replace(/[&<>"]/g, (ch) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]
+  ));
+}
+
+function sendHtml(res, html) {
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(html);
+}
+
+function page(title, body) {
+  return `<!doctype html><html><head><meta charset="utf-8">
+<title>${esc(title)}</title>
+<meta http-equiv="refresh" content="60">
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 -apple-system,Segoe UI,sans-serif; margin: 0; background: #f4f5f7; color: #1a1a2e; }
+  header { padding: 18px 24px 8px; }
+  h1 { margin: 0; font-size: 20px; }
+  .meta { color: #667; font-size: 12px; margin-top: 4px; }
+  .meta a, header a { color: #2563eb; text-decoration: none; }
+  .nav { margin-top: 6px; font-size: 13px; }
+  .nav a { color: #2563eb; text-decoration: none; padding: 2px 8px; border-radius: 6px; }
+  .nav a.navon { background: #2563eb; color: #fff; }
+  .board { display: flex; gap: 10px; padding: 8px 20px 40px; overflow-x: auto; align-items: flex-start; }
+  .lane { flex: 0 0 230px; background: #e9ebf0; border-radius: 8px; padding: 6px; transition: background .12s; }
+  .lane-muted { opacity: .55; }
+  .lane-over { background: #d6e4ff; outline: 2px dashed #2563eb; }
+  .lane-head { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: #445; padding: 4px 6px; }
+  .lane-body { display: flex; flex-direction: column; gap: 5px; min-height: 28px; }
+  .lane-empty { color: #aab; text-align: center; padding: 8px; }
+  .mini { display: block; background: #fff; border-radius: 6px; border-left: 3px solid #94a3b8; padding: 6px 8px; text-decoration: none; color: #1a1a2e; cursor: grab; }
+  .mini:active { cursor: grabbing; }
+  .mini:hover { background: #f0f3ff; }
+  .mini-aging { background: #fff1ee; box-shadow: inset 0 0 0 2px #e0533b; }
+  .mini-blocked { box-shadow: inset 0 0 0 2px #b91c1c; }
+  .mini-title { display: block; font-size: 12px; line-height: 1.35; color: #1a1a2e; text-decoration: none; }
+  .mini-title:hover { color: #2563eb; }
+  .mini-foot { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 10px; margin-top: 6px; }
+  .mini-meta { display: flex; align-items: center; gap: 5px; min-width: 0; }
+  .mini-dim { color: #889; }
+  .mini-foot .age { font-size: 10px; padding: 1px 5px; }
+  .mini-acts { display: flex; gap: 3px; flex: none; }
+  .mini-act { text-decoration: none; font-size: 11px; line-height: 1; padding: 3px 5px; border-radius: 4px; background: #e8ecf6; color: #2563eb; }
+  .mini-act:hover { background: #2563eb; color: #fff; }
+  .mini-act.act-next { background: #dcfce7; color: #16a34a; }
+  .mini-act.act-next:hover, .mini-act.act-fired { background: #16a34a; color: #fff; }
+  .blk { background: #b91c1c; color: #fff; font-weight: 700; font-size: 9px; padding: 1px 4px; border-radius: 3px; }
+  .badge.blocked { background: #b91c1c; color: #fff; font-weight: 700; font-size: 11px; padding: 2px 8px; }
+  h2 { margin: 22px 24px 6px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #556; }
+  .count { background: #dde; border-radius: 10px; padding: 1px 8px; font-size: 11px; }
+  details.stage-sec { margin: 0 24px; }
+  details.stage-sec > summary { cursor: pointer; list-style: none; margin: 20px 0 4px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #556; user-select: none; }
+  details.stage-sec > summary::-webkit-details-marker { display: none; }
+  details.stage-sec > summary::before { content: "\\25B8\\00a0\\00a0"; color: #99a; }
+  details.stage-sec[open] > summary::before { content: "\\25BE\\00a0\\00a0"; }
+  .stage-sec .card { margin-left: 0; margin-right: 0; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(20,20,40,.5); display: flex; align-items: flex-start; justify-content: center; padding: 36px 16px; overflow: auto; z-index: 50; }
+  .modal-overlay[hidden] { display: none; }
+  .modal-box { position: relative; background: #f4f5f7; border-radius: 10px; width: 100%; max-width: 660px; padding: 30px 14px 14px; box-shadow: 0 12px 40px rgba(0,0,0,.3); }
+  .modal-close { position: absolute; top: 4px; right: 12px; border: none; background: transparent; font-size: 24px; line-height: 1; cursor: pointer; color: #667; }
+  .modal-box .card { margin: 0; }
+  .chips { padding: 4px 20px 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font-size: 12px; padding: 3px 10px; border-radius: 12px; background: #e6e8ee; color: #334; text-decoration: none; }
+  .chip.on { background: #2563eb; color: #fff; }
+  .card { background: #fff; margin: 6px 24px; padding: 10px 14px; border-radius: 8px; border-left: 3px solid #c8cdd8; }
+  .card.is-aging { border-left: 6px solid #e0533b; background: #fff5f3; box-shadow: 0 0 0 1px #f3c4ba; }
+  .card-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .title { font-weight: 600; font-size: 14px; }
+  .intent { color: #445; margin: 3px 0; }
+  .standing { color: #667; font-size: 12px; }
+  .notes { color: #8a5a00; font-size: 12px; margin-top: 3px; }
+  .nextstep { margin-top: 6px; padding: 5px 8px; background: #eef4ff; border-radius: 6px; font-size: 12px; color: #1e3a5f; }
+  .ns-label { font-weight: 700; color: #2563eb; }
+  .ns-dot { color: #2563eb; font-size: 9px; }
+  .card-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; gap: 10px; flex-wrap: wrap; }
+  .dim { color: #889; font-size: 12px; }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 4px; }
+  .badge.area { background: #eef; color: #335; }
+  .badge.aging { background: #e0533b; color: #fff; font-weight: 700; font-size: 11px; padding: 2px 8px; letter-spacing: .03em; }
+  .age { font-weight: 600; padding: 1px 7px; border-radius: 4px; font-size: 11px; }
+  .age-fresh { background: #e6f4ea; color: #1a7f37; }
+  .age-warm { background: #fde8b0; color: #8a5a00; }
+  .age-aging { background: #e0533b; color: #fff; }
+  .btn { font-size: 12px; padding: 4px 10px; border-radius: 6px; text-decoration: none; background: #e6e8ee; color: #223; }
+  .btn.go { background: #16a34a; color: #fff; }
+  .btn.ghost { background: transparent; color: #2563eb; }
+  .log { margin: 8px 24px 40px; }
+  .log-gap { text-align: center; color: #889; font-size: 11px; margin: 12px 0; }
+  .msg { background: #fff; border-radius: 8px; margin: 6px 0; padding: 8px 12px; }
+  .msg.user { border-left: 3px solid #2563eb; }
+  .msg.assistant { border-left: 3px solid #16a34a; }
+  .role { font-size: 11px; text-transform: uppercase; color: #889; }
+  .text { white-space: pre-wrap; word-break: break-word; }
+</style></head><body>${body}</body></html>`;
+}
+
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i].startsWith("--")) {
+      const key = argv[i].slice(2);
+      const has = argv[i + 1] !== undefined && !argv[i + 1].startsWith("--");
+      out[key] = has ? argv[++i] : true;
+    }
+  }
+  return out;
+}
+

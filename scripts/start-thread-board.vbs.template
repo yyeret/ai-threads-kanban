@@ -1,0 +1,17 @@
+' Launches the AI thread board web server with no visible console window.
+' Used by the "AI Thread Board" Windows scheduled task (logon trigger).
+' This file is a template — install.ps1 writes the rendered copy into
+' your local install directory with the right paths.
+Dim shell, nodePath, scriptPath, fso
+Set shell = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+
+nodePath = "{{NODE_EXE}}"
+If Not fso.FileExists(nodePath) Then
+  nodePath = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Programs\nodejs\node.exe"
+End If
+
+scriptPath = "{{REPO_ROOT}}\scripts\serve-thread-board.mjs"
+
+' 0 = hidden window, False = do not wait for it to exit.
+shell.Run """" & nodePath & """ """ & scriptPath & """", 0, False

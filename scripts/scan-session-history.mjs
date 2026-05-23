@@ -1,0 +1,649 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { resolveRegistryDir } from "./lib/paths.mjs";
+
+const args = parseArgs(process.argv.slice(2));
+const home = os.homedir();
+const sinceDays = Number(args.days || 30);
+const cutoff = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
+const machine = String(args.machine || os.hostname());
+const machineSlug = safeFileName(machine);
+const outputDir = path.resolve(
+  args.outputDir ? path.resolve(expandHome(args.outputDir)) : resolveRegistryDir(),
+);
+
+const stages = [
+  "Funnel / Triage",
+  "Specify",
+  "Plan",
+  "Implement",
+  "Review / Ship",
+  "Done / Archive Candidates",
+];
+
+const cards = [
+  ...scanClaude(),
+  ...scanCodex(),
+  ...scanGemini(),
+].sort((a, b) => new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime());
+
+fs.mkdirSync(outputDir, { recursive: true });
+writeJsonl(path.join(outputDir, `threads.${machineSlug}.jsonl`), cards);
+fs.writeFileSync(path.join(outputDir, `current-board.${machineSlug}.md`), renderBoard(cards), "utf8");
+writeJsonl(path.join(outputDir, "threads.jsonl"), cards);
+fs.writeFileSync(path.join(outputDir, "current-board.md"), renderBoard(cards), "utf8");
+
+console.log(`Wrote ${cards.length} cards for ${machine} to ${outputDir}`);
+
+function scanClaude() {
+  const claudeDir = path.join(home, ".claude");
+  const sessionsDir = path.join(claudeDir, "sessions");
+  const projectsDir = path.join(claudeDir, "projects");
+  const history = readClaudeHistory(path.join(claudeDir, "history.jsonl"));
+  const activeSessions = readJsonFiles(sessionsDir).map(({ file, json }) => ({ file, json }));
+  const transcriptBySession = indexFiles(projectsDir, /\.jsonl$/i, (file) => path.basename(file, ".jsonl"));
+
+  return activeSessions.flatMap(({ file, json }) => {
+    const sessionId = String(json.sessionId || "");
+    if (!sessionId) return [];
+    const transcript = transcriptBySession.get(sessionId);
+    const summary = transcript ? summarizeClaudeTranscript(transcript) : {};
+    const cwd = json.cwd || summary.cwd || "";
+    const firstPrompt = clean(summary.firstUser || history.get(sessionId) || "");
+    const latest = clean(summary.lastAssistant || summary.lastUser || "");
+    const lastActivity = summary.lastTimestamp || fileMtime(transcript || file);
+    if (new Date(lastActivity).getTime() < cutoff) return [];
+    const title = titleFrom(summary.slug || firstPrompt || `Claude ${shortId(sessionId)}`);
+    const evidence = compact([
+      summary.slug ? `plan slug: ${summary.slug}` : "",
+      firstPrompt ? `first prompt: ${truncate(firstPrompt, 160)}` : "",
+      latest ? `latest: ${truncate(latest, 180)}` : "",
+      summary.toolCount ? `${summary.toolCount} tool events` : "",
+    ]);
+    return [makeCard({
+      harness: "Claude",
+      sessionId,
+      title,
+      cwd,
+      source: compact([file, transcript]).join("; "),
+      transcriptPath: transcript || "",
+      firstPrompt,
+      latest,
+      lastActivity,
+      evidence,
+      resumeCommand: `claude --resume ${sessionId}`,
+      openCommand: transcript ? `code "${transcript}"` : "",
+      signals: { ...summary, firstPrompt, latest },
+    })];
+  });
+}
+
+function scanCodex() {
+  const codexDir = path.join(home, ".codex");
+  const indexPath = path.join(codexDir, "session_index.jsonl");
+  const rolloutFiles = indexFiles(path.join(codexDir, "sessions"), /\.jsonl$/i, (file) => {
+    const match = path.basename(file).match(/([0-9a-f]{8}-[0-9a-f-]{27,})/i);
+    return match?.[1] || "";
+  });
+  return readJsonl(indexPath).flatMap((item) => {
+    const sessionId = String(item.id || "");
+    if (!sessionId) return [];
+    const transcript = rolloutFiles.get(sessionId);
+    const summary = transcript ? summarizeCodexTranscript(transcript) : {};
+    const lastActivity = item.updated_at || summary.lastTimestamp || fileMtime(transcript);
+    if (new Date(lastActivity).getTime() < cutoff) return [];
+    // thread_name may carry a "[Stage] " prefix stamped by apply-thread-names;
+    // strip it so the prefix never compounds and never biases classification.
+    const title = clean(stripStagePrefix(item.thread_name) || summary.firstUser || `Codex ${shortId(sessionId)}`);
+    const cwd = summary.cwd || "";
+    const firstPrompt = clean(summary.firstUser || "");
+    const latest = clean(summary.lastAssistant || summary.lastUser || "");
+    const evidence = compact([
+      firstPrompt ? `first prompt: ${truncate(firstPrompt, 160)}` : "",
+      latest ? `latest: ${truncate(latest, 180)}` : "",
+      summary.toolCount ? `${summary.toolCount} tool events` : "",
+      summary.source ? `source: ${typeof summary.source === "string" ? summary.source : "subagent"}` : "",
+    ]);
+    return [makeCard({
+      harness: "Codex",
+      sessionId,
+      title,
+      cwd,
+      source: compact([indexPath, transcript]).join("; "),
+      transcriptPath: transcript || "",
+      firstPrompt,
+      latest,
+      lastActivity,
+      evidence,
+      resumeCommand: `codex resume ${sessionId}`,
+      openCommand: transcript ? `code "${transcript}"` : "",
+      signals: { ...summary, firstPrompt, latest },
+    })];
+  });
+}
+
+function scanGemini() {
+  const geminiDir = path.join(home, ".gemini");
+  const tmpDir = path.join(geminiDir, "tmp");
+  const projectMap = readGeminiProjects(path.join(geminiDir, "projects.json"));
+  return walkFiles(tmpDir, (file) => /[\\/]chats[\\/]session-.*\.jsonl?$/i.test(file)).flatMap((file) => {
+    const summary = summarizeGeminiTranscript(file);
+    const sessionId = summary.sessionId || path.basename(file).replace(/^session-|\.jsonl?$/g, "");
+    const projectSlug = projectFromGeminiPath(file);
+    const cwd = projectMap.get(projectSlug) || projectSlug || "";
+    const lastActivity = summary.lastTimestamp || fileMtime(file);
+    if (new Date(lastActivity).getTime() < cutoff) return [];
+    const firstPrompt = clean(summary.firstUser || "");
+    const latest = clean(summary.lastAssistant || summary.lastUser || "");
+    const title = titleFrom(summary.topicTitle || firstPrompt || `Gemini ${shortId(sessionId)}`);
+    const evidence = compact([
+      summary.topicIntent ? `intent: ${truncate(summary.topicIntent, 180)}` : "",
+      firstPrompt ? `first prompt: ${truncate(firstPrompt, 160)}` : "",
+      latest ? `latest: ${truncate(latest, 180)}` : "",
+      summary.toolNames?.length ? `tools: ${summary.toolNames.slice(0, 8).join(", ")}` : "",
+    ]);
+    return [makeCard({
+      harness: "Gemini",
+      sessionId,
+      title,
+      cwd,
+      source: compact([path.join(geminiDir, "projects.json"), file]).join("; "),
+      transcriptPath: file,
+      firstPrompt,
+      latest,
+      lastActivity,
+      evidence,
+      resumeCommand: `cd "${cwd || process.cwd()}" && gemini --resume latest`,
+      openCommand: `code "${file}"`,
+      signals: { ...summary, firstPrompt, latest },
+    })];
+  });
+}
+
+function repoKey(cwd) {
+  const parts = String(cwd || "").split(/[\\/]+/).filter(Boolean);
+  return (parts[parts.length - 1] || "unknown").toLowerCase();
+}
+
+function intentHash(input) {
+  const basis = clean(input.firstPrompt || input.signals?.topicIntent || input.title || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+  return crypto.createHash("sha1").update(basis || input.sessionId).digest("hex").slice(0, 10);
+}
+
+// Commit hashes a thread's recent assistant turns claim to have made.
+function extractCommitHashes(recentAssistant) {
+  const text = (recentAssistant || []).join("  ");
+  if (!/commit|push/i.test(text)) return [];
+  const hits = text.match(/\b[0-9a-f]{7,40}\b/g) || [];
+  return [...new Set(hits.filter((h) => h.length <= 12))].slice(0, 5);
+}
+
+// True if any of the hashes is reachable from a remote branch in that repo.
+function commitsOnRemote(cwd, hashes) {
+  if (!cwd || !hashes.length || !fs.existsSync(cwd)) return false;
+  for (const h of hashes) {
+    try {
+      const out = execFileSync("git", ["-C", cwd, "branch", "-r", "--contains", h], {
+        stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
+      }).toString().trim();
+      if (out) return true;
+    } catch {
+      /* not a commit, or git unavailable — ignore */
+    }
+  }
+  return false;
+}
+
+function makeCard(input) {
+  const outcome = inferOutcome(input);
+  let { stage, blocked, status, trackingDecision, reason } = classify(input, outcome);
+  // Git-aware: if work this thread claims to have committed is already on the
+  // remote, it shipped — promote it to Done regardless of how it phrased it.
+  if (stage === "Review / Ship" || stage === "Implement") {
+    const hashes = extractCommitHashes(input.signals.recentAssistant);
+    if (commitsOnRemote(input.cwd, hashes)) {
+      stage = "Done / Archive Candidates";
+      status = "shipped";
+      trackingDecision = "archive";
+      reason = `A commit referenced in this thread is on the remote — work shipped. ${reason}`;
+    }
+  }
+  const repo = repoKey(input.cwd);
+  const intent = intentHash(input);
+  return {
+    id: `${input.harness.toLowerCase()}-${shortId(input.sessionId)}`,
+    thread_id: crypto.createHash("sha1").update(`${repo}|${intent}`).digest("hex").slice(0, 12),
+    intent_hash: intent,
+    repo_key: repo,
+    machine,
+    harness: input.harness,
+    session_id: input.sessionId,
+    title: input.title,
+    outcome_intent: outcome,
+    stage,
+    blocked,
+    status,
+    tracking_decision: trackingDecision,
+    where_it_stands: reason,
+    cwd: input.cwd,
+    last_activity: input.lastActivity,
+    transcript_path: input.transcriptPath,
+    open_transcript: input.openCommand,
+    continue_session: input.resumeCommand,
+    found_in: input.source,
+    first_activity: input.signals.firstTimestamp || "",
+    tool_count: Number(input.signals.toolCount || 0),
+    user_turns: Number(input.signals.userCount || 0),
+    plan_mode: Boolean(input.signals.slug),
+    evidence: input.evidence,
+  };
+}
+
+function classify(input, outcome) {
+  // Terminal state is read from the final assistant turn; completion signals
+  // are read from the last few assistant turns (work often finishes a turn or
+  // two before the session ends on a tangent). Topic = title + first prompt.
+  const tail = clean(input.latest).toLowerCase();
+  const recent = clean((input.signals.recentAssistant || [input.latest]).join("  ")).toLowerCase();
+  const topic = `${input.title} ${input.firstPrompt}`.toLowerCase();
+  const toolCount = Number(input.signals.toolCount || 0);
+
+  // A genuine block is terminal: a short message, or the phrase sits near the
+  // end of the final turn — not a blocked phrase mentioned mid-narration.
+  const blockMatch = tail.match(/hit (your|the) (usage )?limit|\brate limit\b|\busage limit\b|\bsession limit\b|spend cap (reached|hit)|hit .{0,14}spend cap|out of (usage|credits)|are you (still )?(there|alive)\?/);
+  const blocked = Boolean(blockMatch) && (tail.length < 400 || blockMatch.index > tail.length - 250);
+  const shipped = /(?<!not )\bpushed\b|committed and pushed|everything up-to-date|merged to main/.test(recent);
+  const needsReview = /\bnot pushed\b|say the word|needs review|ready to review|ready for review|committed as|leave (it|that|the push) to you|want me to push/.test(recent);
+  const done = shipped || /\bdone[.!]|\bcompleted\b|no pending|all \d+ .*(saved|patched|synthesized|done)|skipped(?! a)/.test(recent);
+
+  const systemNoise = /^skill conflict detected|^status check$|^confirming operational status/.test(topic.trim());
+  const hasDurable = /\b(commit|push|brief|deck|proposal|board|publish|deploy|report|artifact|spec)\b/.test(topic);
+  // Plan = how to build it; Specify = what to build / whether to. Plan wins
+  // ties (it is further along the flow), and a Claude plan file is decisive.
+  const planFile = Boolean(input.signals.slug);
+  const isPlan = planFile || /\bplan\b|implementation|architecture|\btasks\b|roadmap|how to (build|implement)/.test(topic);
+  const isSpecify = /\bspec\b|specif|requirement|assess|evaluate|should (we|i)|recommend|\bscope\b|discovery|whether to|figure out|\bresearch\b|strateg/.test(topic);
+  const isImplement = /\b(build|add|fix|enable|automat|create|import|update|replace|implement|scrape|generate|commit|push)\b/.test(topic);
+  const below = systemNoise || (toolCount < 3 && !hasDurable && !isPlan && !isSpecify && !isImplement);
+
+  // Stage is the flow position; `blocked` is an orthogonal flag, not a stage.
+  let stage, status, trackingDecision, reason;
+  if (needsReview && !shipped) {
+    [stage, status, trackingDecision, reason] = ["Review / Ship", "needs-review", "track", "Work exists but the latest turn says it still needs a push, review, or decision."];
+  } else if (done) {
+    [stage, status, trackingDecision, reason] = ["Done / Archive Candidates", "done", "archive", "Latest assistant turn indicates the outcome was shipped or completed."];
+  } else if (below) {
+    // Funnel / Triage is the holding lane for already-started threads that are
+    // not yet clearly worth tracking — it absorbs the old "below threshold".
+    [stage, status, trackingDecision, reason] = ["Funnel / Triage", "triage", "wait-for-threshold", "Low evidence this is a thread worth tracking yet."];
+  } else if (isImplement) {
+    [stage, status, trackingDecision, reason] = ["Implement", "in-progress", hasDurable || toolCount >= 4 ? "track" : "wait-for-threshold", "Topic indicates concrete build/edit/import work, no completion signal yet."];
+  } else if (isPlan) {
+    [stage, status, trackingDecision, reason] = ["Plan", "planning", "track", "Topic indicates implementation planning or design."];
+  } else if (isSpecify) {
+    [stage, status, trackingDecision, reason] = ["Specify", "specifying", "track", "Topic indicates defining what to build, assessment, or a decision."];
+  } else {
+    [stage, status, trackingDecision, reason] = ["Funnel / Triage", "triage", "wait-for-threshold", `Outcome inferred as: ${truncate(outcome, 120)}`];
+  }
+  if (blocked) {
+    status = "blocked";
+    reason = `Blocked — latest turn reports a usage/rate limit or asks the user to continue. ${reason}`;
+  }
+  return { stage, blocked, status, trackingDecision, reason };
+}
+
+function inferOutcome(input) {
+  const text = clean(input.signals.topicIntent || input.firstPrompt || input.title);
+  if (!text) return `Clarify outcome for ${input.title}`;
+  return sentenceCase(truncate(text, 220));
+}
+
+function pushRecent(summary, text) {
+  const t = clean(text);
+  if (!t) return;
+  summary.lastAssistant = t;
+  (summary.recentAssistant ||= []).push(t);
+  if (summary.recentAssistant.length > 3) summary.recentAssistant.shift();
+}
+
+function summarizeClaudeTranscript(file) {
+  const summary = { toolCount: 0, userCount: 0, recentAssistant: [] };
+  for (const item of readJsonl(file)) {
+    if (item.timestamp && !summary.firstTimestamp) summary.firstTimestamp = item.timestamp;
+    summary.lastTimestamp = item.timestamp || summary.lastTimestamp;
+    summary.cwd = item.cwd || summary.cwd;
+    summary.slug = item.slug || summary.slug;
+    if (item.type === "user" && item.message?.content && !summary.firstUser) {
+      const prompt = substantivePrompt(extractClaudeContent(item.message.content));
+      if (prompt) summary.firstUser = prompt;
+    }
+    if (item.type === "user" && item.message?.content) {
+      summary.userCount += 1;
+      summary.lastUser = extractClaudeContent(item.message.content);
+    }
+    if (item.type === "assistant" && item.message?.content) pushRecent(summary, extractClaudeContent(item.message.content));
+    if (item.type && /tool|hook|file-history/.test(item.type)) summary.toolCount += 1;
+  }
+  return summary;
+}
+
+function summarizeCodexTranscript(file) {
+  const summary = { toolCount: 0, userCount: 0, recentAssistant: [] };
+  for (const item of readJsonl(file)) {
+    if (item.timestamp && !summary.firstTimestamp) summary.firstTimestamp = item.timestamp;
+    summary.lastTimestamp = item.timestamp || summary.lastTimestamp;
+    if (item.type === "session_meta") {
+      Object.assign(summary, {
+        cwd: item.payload?.cwd,
+        source: item.payload?.source,
+        sessionId: item.payload?.id,
+      });
+    }
+    if (item.type === "response_item" && item.payload?.type === "message") {
+      const text = extractCodexContent(item.payload.content);
+      if (item.payload.role === "user" && !summary.firstUser) {
+        const prompt = substantivePrompt(text);
+        if (prompt) summary.firstUser = prompt;
+      }
+      if (item.payload.role === "user") {
+        summary.userCount += 1;
+        summary.lastUser = text;
+      }
+      if (item.payload.role === "assistant") pushRecent(summary, text);
+    }
+    if (item.type === "event_msg" && item.payload?.type === "agent_message") pushRecent(summary, item.payload.message);
+    if (/tool|function|exec|patch/i.test(`${item.type} ${item.payload?.type || ""}`)) summary.toolCount += 1;
+  }
+  return summary;
+}
+
+function summarizeGeminiTranscript(file) {
+  const summary = { toolCount: 0, userCount: 0, toolNames: [], recentAssistant: [] };
+  const tools = new Set();
+  for (const item of readJsonl(file)) {
+    summary.sessionId = item.sessionId || summary.sessionId;
+    const ts = item.timestamp || item.lastUpdated;
+    if (ts && !summary.firstTimestamp) summary.firstTimestamp = ts;
+    summary.lastTimestamp = ts || summary.lastTimestamp;
+    if (item.type === "user" && item.content) {
+      const text = extractGeminiContent(item.content);
+      if (!summary.firstUser) {
+        const prompt = substantivePrompt(text);
+        if (prompt) summary.firstUser = prompt;
+      }
+      summary.userCount += 1;
+      summary.lastUser = text;
+    }
+    if ((item.type === "gemini" || item.type === "assistant" || item.type === "model") && item.content) {
+      pushRecent(summary, typeof item.content === "string" ? item.content : extractGeminiContent(item.content));
+    }
+    for (const call of item.toolCalls || []) {
+      summary.toolCount += 1;
+      if (call.name) tools.add(call.name);
+      if (call.name === "update_topic") {
+        summary.topicTitle = call.args?.title || summary.topicTitle;
+        summary.topicIntent = call.args?.strategic_intent || summary.topicIntent;
+      }
+    }
+  }
+  summary.toolNames = [...tools].sort();
+  return summary;
+}
+
+function renderBoard(items) {
+  const lines = [
+    "# Current AI Session Board",
+    "",
+    `Generated: ${new Date().toISOString()}`,
+    `Machine: ${machine}`,
+    `Window: last ${sinceDays} days`,
+    "",
+    "> Read-only board from native harness history. Verify before acting on inferred stage/status.",
+    "",
+  ];
+  for (const stage of stages) {
+    const stageItems = items.filter((item) => item.stage === stage);
+    lines.push(`## ${stage}`, "");
+    if (!stageItems.length) {
+      lines.push("_No cards._", "");
+      continue;
+    }
+    for (const item of stageItems) {
+      lines.push(`### ${escapeMd(item.title)} (${item.harness} ${shortId(item.session_id)})`);
+      lines.push("");
+      lines.push(`- Intent/outcome: ${escapeMd(item.outcome_intent)}`);
+      lines.push(`- Where it stands: ${escapeMd(item.status)} - ${escapeMd(item.where_it_stands)}`);
+      lines.push(`- Tracking: ${escapeMd(item.tracking_decision)}`);
+      lines.push(`- Last activity: ${item.last_activity || "unknown"}`);
+      if (item.cwd) lines.push(`- Workspace: \`${item.cwd}\``);
+      if (item.transcript_path) lines.push(`- Transcript: \`${item.transcript_path}\``);
+      if (item.open_transcript) lines.push(`- Open: \`${item.open_transcript}\``);
+      if (item.continue_session) lines.push(`- Continue: \`${item.continue_session}\``);
+      lines.push(`- Found in: \`${item.found_in}\``);
+      if (item.evidence?.length) {
+        lines.push("- Evidence:");
+        for (const ev of item.evidence.slice(0, 4)) lines.push(`  - ${escapeMd(ev)}`);
+      }
+      lines.push("");
+    }
+  }
+  return `${lines.join("\n").trim()}\n`;
+}
+
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg.startsWith("--")) {
+      const key = arg.slice(2);
+      out[key] = argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[++i] : true;
+    }
+  }
+  return out;
+}
+
+
+function readClaudeHistory(file) {
+  const map = new Map();
+  for (const item of readJsonl(file)) {
+    if (item.sessionId && item.display) map.set(item.sessionId, item.display);
+  }
+  return map;
+}
+
+function readGeminiProjects(file) {
+  const map = new Map();
+  const json = readJson(file);
+  for (const [cwd, slug] of Object.entries(json?.projects || {})) map.set(slug, cwd);
+  return map;
+}
+
+function readJsonFiles(dir) {
+  return walkFiles(dir, (file) => file.toLowerCase().endsWith(".json")).flatMap((file) => {
+    const json = readJson(file);
+    return json ? [{ file, json }] : [];
+  });
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function readJsonl(file) {
+  if (!file || !fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8").split(/\r?\n/).flatMap((line) => {
+    if (!line.trim()) return [];
+    try {
+      return [JSON.parse(line)];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function writeJsonl(file, rows) {
+  fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf8");
+}
+
+function walkFiles(root, predicate = () => true) {
+  if (!root || !fs.existsSync(root)) return [];
+  const out = [];
+  const stack = [root];
+  while (stack.length) {
+    const current = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) stack.push(full);
+      else if (predicate(full)) out.push(full);
+    }
+  }
+  return out;
+}
+
+function indexFiles(root, regex, keyFn) {
+  const map = new Map();
+  for (const file of walkFiles(root, (candidate) => regex.test(candidate))) {
+    const key = keyFn(file);
+    if (key && (!map.has(key) || fileMtime(file) > fileMtime(map.get(key)))) map.set(key, file);
+  }
+  return map;
+}
+
+function fileMtime(file) {
+  if (!file) return "";
+  try {
+    return fs.statSync(file).mtime.toISOString();
+  } catch {
+    return "";
+  }
+}
+
+function projectFromGeminiPath(file) {
+  const parts = file.split(/[\\/]/);
+  const tmpIndex = parts.lastIndexOf("tmp");
+  return tmpIndex >= 0 ? parts[tmpIndex + 1] : "";
+}
+
+function extractClaudeContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((part) => part.text || part.content || "").join(" ");
+  return "";
+}
+
+function extractCodexContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((part) => part.text || part.content || "").join(" ");
+  return "";
+}
+
+function extractGeminiContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((part) => part.text || part.content || "").join(" ");
+  return "";
+}
+
+function titleFrom(text) {
+  const cleaned = clean(text);
+  if (!cleaned) return "Untitled session";
+  return sentenceCase(truncate(cleaned.replace(/^<[^>]+>/, ""), 70));
+}
+
+function clean(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function isSubstantivePrompt(text) {
+  const cleaned = clean(text).toLowerCase();
+  if (!cleaned) return false;
+  const skipPrefixes = [
+    "<environment_context>",
+    "<local-command-caveat>",
+    "<ide_opened_file>",
+    "<ide_selection>",
+    "<system-reminder>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "# agents.md instructions",
+    "# claude.md",
+    "# context from my ide setup",
+    "# files mentioned by the user",
+  ];
+  if (skipPrefixes.some((prefix) => cleaned.startsWith(prefix))) return false;
+  // Codex/Claude inject repo instruction blocks as the first "user" turn.
+  if (cleaned.includes("<instructions>") && cleaned.length > 400) return false;
+  return true;
+}
+
+// Returns the real user request, stripped of injected IDE-context wrappers,
+// or null if the turn is not a substantive prompt.
+function substantivePrompt(raw) {
+  let text = clean(raw);
+  if (!text) return null;
+  const marker = text.match(/##\s*my request(?: for [a-z]+)?\s*:?\s*/i);
+  if (marker) text = clean(text.slice(marker.index + marker[0].length));
+  if (!text || !isSubstantivePrompt(text)) return null;
+  return text;
+}
+
+function truncate(text, length) {
+  const cleaned = clean(text);
+  return cleaned.length > length ? `${cleaned.slice(0, length - 3)}...` : cleaned;
+}
+
+function sentenceCase(text) {
+  const cleaned = clean(text);
+  return cleaned ? cleaned[0].toUpperCase() + cleaned.slice(1) : "";
+}
+
+function shortId(id) {
+  return String(id || "unknown").slice(0, 8);
+}
+
+function stripStagePrefix(text) {
+  return String(text || "").replace(/^\s*\[[^\]]{1,24}\]\s*/, "");
+}
+
+function compact(values) {
+  return values.filter((value) => value !== undefined && value !== null && String(value).trim());
+}
+
+function escapeMd(text) {
+  return String(text || "").replace(/\|/g, "\\|");
+}
+
+function expandHome(value) {
+  if (!value) return value;
+  if (value === "~") return home;
+  if (value.startsWith("~/") || value.startsWith("~\\")) return path.join(home, value.slice(2));
+  return value;
+}
+
+function safeFileName(value) {
+  return String(value || "unknown")
+    .trim()
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "unknown";
+}
