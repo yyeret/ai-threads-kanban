@@ -44,19 +44,31 @@ function scanClaude() {
   const sessionsDir = path.join(claudeDir, "sessions");
   const projectsDir = path.join(claudeDir, "projects");
   const history = readClaudeHistory(path.join(claudeDir, "history.jsonl"));
-  const activeSessions = readJsonFiles(sessionsDir).map(({ file, json }) => ({ file, json }));
-  const transcriptBySession = indexFiles(projectsDir, /\.jsonl$/i, (file) => path.basename(file, ".jsonl"));
 
-  return activeSessions.flatMap(({ file, json }) => {
-    const sessionId = String(json.sessionId || "");
+  // Drive from durable transcripts under ~/.claude/projects/. Each .jsonl is
+  // one session whose id is the basename. ~/.claude/sessions/*.json only lists
+  // *currently live* PIDs and disappears on exit — scanning it alone misses
+  // every ended session, which is most of them. We still consult those PID
+  // files to enrich cwd when the transcript doesn't carry one yet.
+  const liveByid = new Map();
+  for (const { json } of readJsonFiles(sessionsDir)) {
+    if (json?.sessionId) liveByid.set(String(json.sessionId), json);
+  }
+  const transcripts = walkFiles(projectsDir, (f) => f.toLowerCase().endsWith(".jsonl"));
+
+  return transcripts.flatMap((transcript) => {
+    const sessionId = path.basename(transcript, ".jsonl");
     if (!sessionId) return [];
-    const transcript = transcriptBySession.get(sessionId);
-    const summary = transcript ? summarizeClaudeTranscript(transcript) : {};
-    const cwd = json.cwd || summary.cwd || "";
+    const live = liveByid.get(sessionId);
+    const summary = summarizeClaudeTranscript(transcript);
+    const cwd = (live && live.cwd) || summary.cwd || decodeClaudeProjectDir(transcript) || "";
     const firstPrompt = clean(summary.firstUser || history.get(sessionId) || "");
     const latest = clean(summary.lastAssistant || summary.lastUser || "");
-    const lastActivity = summary.lastTimestamp || fileMtime(transcript || file);
+    const lastActivity = summary.lastTimestamp || fileMtime(transcript);
     if (new Date(lastActivity).getTime() < cutoff) return [];
+    // Skip transcripts with zero user turns — they're harness boilerplate
+    // (SessionStart hook output only, no actual prompt) and never carry intent.
+    if (!summary.userCount && !firstPrompt) return [];
     const title = titleFrom(summary.slug || firstPrompt || `Claude ${shortId(sessionId)}`);
     const evidence = compact([
       summary.slug ? `plan slug: ${summary.slug}` : "",
@@ -69,8 +81,8 @@ function scanClaude() {
       sessionId,
       title,
       cwd,
-      source: compact([file, transcript]).join("; "),
-      transcriptPath: transcript || "",
+      source: transcript,
+      transcriptPath: transcript,
       firstPrompt,
       latest,
       lastActivity,
@@ -80,6 +92,18 @@ function scanClaude() {
       signals: { ...summary, firstPrompt, latest },
     })];
   });
+}
+
+// ~/.claude/projects/ encodes cwd as a dir name with separators flattened to
+// dashes (e.g. "C--Users-yuval-Github-ai-skill-library"). Recovering the path
+// exactly is ambiguous (single vs double dash), so this is a best effort used
+// only when the transcript itself didn't record cwd.
+function decodeClaudeProjectDir(transcript) {
+  const dir = path.basename(path.dirname(transcript));
+  if (!dir) return "";
+  let s = dir.replace(/^([A-Za-z])--/, "$1:\\");
+  s = s.replace(/-/g, path.sep);
+  return s;
 }
 
 function scanCodex() {

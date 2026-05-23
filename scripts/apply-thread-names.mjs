@@ -53,8 +53,14 @@ for (const r of records) {
   // flat picker list; otherwise the flow stage.
   const tag = r.blocked ? "Blocked" : (STAGE_SHORT[r.stage] || "Thread");
   const label = `[${tag}] ${stripPrefix(r.display_title || r.title || "Untitled")}`;
-  const finished = r.manual_status === "done"
-    && (r.manual_stage === "Done / Archive Candidates" || r.stage === "Done / Archive Candidates");
+  const inDoneStage = r.manual_stage === "Done / Archive Candidates"
+    || r.stage === "Done / Archive Candidates";
+  // Default: only archive when the user has explicitly marked the thread done.
+  // --archive-done-stage: one-shot override for cleanup — archive anything
+  // currently sitting in the Done lane regardless of manual_status.
+  const finished = args["archive-done-stage"]
+    ? inDoneStage
+    : (r.manual_status === "done" && inDoneStage);
   for (const s of r.sessions || []) {
     if (s.harness === "Codex" && s.session_id) {
       if (finished) codexArchive.set(s.session_id, s.transcript_path || null);
