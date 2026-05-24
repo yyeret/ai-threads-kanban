@@ -69,7 +69,7 @@ function scanClaude() {
     // Skip transcripts with zero user turns — they're harness boilerplate
     // (SessionStart hook output only, no actual prompt) and never carry intent.
     if (!summary.userCount && !firstPrompt) return [];
-    const title = titleFrom(summary.slug || firstPrompt || `Claude ${shortId(sessionId)}`);
+    const title = titleFrom(summary.slug || claudeTitleFromPrompt(firstPrompt) || `Claude ${shortId(sessionId)}`);
     const evidence = compact([
       summary.slug ? `plan slug: ${summary.slug}` : "",
       firstPrompt ? `first prompt: ${truncate(firstPrompt, 160)}` : "",
@@ -589,6 +589,26 @@ function titleFrom(text) {
   const cleaned = clean(text);
   if (!cleaned) return "Untitled session";
   return sentenceCase(truncate(cleaned.replace(/^<[^>]+>/, ""), 70));
+}
+
+// Turn a raw first user message into a short action-oriented title.
+// Claude has no equivalent of Codex's thread_name, so titles come from the
+// prompt itself. Strip conversational openers ("can you", "please", ...),
+// URLs, leading <tags>, and clip to the first sentence/clause.
+function claudeTitleFromPrompt(text) {
+  let s = clean(text);
+  if (!s) return "";
+  s = s.replace(/^<[^>]+>\s*/g, "");
+  s = s.replace(/https?:\/\/\S+/g, "").trim();
+  // Drop conversational lead-ins so the verb starts the title.
+  s = s.replace(
+    /^(hey|hi|ok|okay|so|um|please|pls|kindly|let'?s|lets|can you|could you|would you|will you|i'?d like (you )?to|i want (you )?to|i need (you )?to|i'?m (going to|gonna)|help me|help us|maybe|just)\s+/i,
+    "",
+  );
+  // Take the first sentence / clause to keep titles tight.
+  const m = s.match(/^[^.?!\n]{3,200}/);
+  if (m) s = m[0];
+  return clean(s);
 }
 
 function clean(text) {

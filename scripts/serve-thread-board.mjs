@@ -32,9 +32,9 @@ const MUTED_STAGES = new Set(["Funnel / Triage", "On Hold", "Done / Archive Cand
 const server = http.createServer((req, res) => {
   try {
     const url = new URL(req.url, `http://127.0.0.1:${port}`);
-    if (url.pathname === "/") return sendHtml(res, renderBoard(url.searchParams.get("area")));
-    if (url.pathname === "/kanban") return sendHtml(res, renderKanban(url.searchParams.get("area")));
-    if (url.pathname === "/kanban-ipsum") return sendHtml(res, renderKanban(null, true));
+    if (url.pathname === "/") return sendHtml(res, renderBoard(url.searchParams.get("area"), url.searchParams.get("harness")));
+    if (url.pathname === "/kanban") return sendHtml(res, renderKanban(url.searchParams.get("area"), false, url.searchParams.get("harness")));
+    if (url.pathname === "/kanban-ipsum") return sendHtml(res, renderKanban(null, true, null));
     if (url.pathname === "/continue") return handleContinue(res, url.searchParams.get("id"), url.searchParams.get("step"));
     if (url.pathname === "/log") return handleLog(res, url.searchParams.get("id"));
     if (url.pathname === "/card") return handleCard(res, url.searchParams.get("id"));
@@ -156,16 +156,44 @@ function openTerminal(cwd, command) {
 
 // --- rendering -------------------------------------------------------------
 
-function chipBar(all, areaFilter, basePath) {
+// Build a querystring keeping the other filter intact so toggling one doesn't
+// drop the other.
+function buildQs(basePath, params) {
+  const entries = Object.entries(params).filter(([, v]) => v);
+  if (!entries.length) return basePath;
+  return `${basePath}?${entries.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&")}`;
+}
+
+function chipBar(all, areaFilter, basePath, harnessFilter) {
   const areas = [...new Set(all.map((t) => t.intent_area || "Other / Unsorted"))].sort();
-  const q = (a) => (a ? `${basePath}?area=${encodeURIComponent(a)}` : basePath);
+  const link = (area) => buildQs(basePath, { area, harness: harnessFilter });
   return [
-    `<a class="chip${areaFilter ? "" : " on"}" href="${basePath}">All (${all.length})</a>`,
+    `<a class="chip${areaFilter ? "" : " on"}" href="${buildQs(basePath, { harness: harnessFilter })}">All (${all.length})</a>`,
     ...areas.map((a) => {
       const n = all.filter((t) => t.intent_area === a).length;
-      return `<a class="chip${areaFilter === a ? " on" : ""}" href="${q(a)}">${esc(a)} (${n})</a>`;
+      return `<a class="chip${areaFilter === a ? " on" : ""}" href="${link(a)}">${esc(a)} (${n})</a>`;
     }),
   ].join("");
+}
+
+// Harness filter: a thread matches a harness if any of its sessions used it.
+function harnessChipBar(all, harnessFilter, basePath, areaFilter) {
+  const harnesses = [...new Set(all.flatMap((t) => t.harnesses || []))].sort();
+  const link = (h) => buildQs(basePath, { area: areaFilter, harness: h });
+  return [
+    `<a class="chip${harnessFilter ? "" : " on"}" href="${buildQs(basePath, { area: areaFilter })}">All harnesses (${all.length})</a>`,
+    ...harnesses.map((h) => {
+      const n = all.filter((t) => (t.harnesses || []).includes(h)).length;
+      return `<a class="chip${harnessFilter === h ? " on" : ""}" href="${link(h)}">${esc(h)} (${n})</a>`;
+    }),
+  ].join("");
+}
+
+function applyFilters(threads, areaFilter, harnessFilter) {
+  let out = threads;
+  if (areaFilter) out = out.filter((t) => t.intent_area === areaFilter);
+  if (harnessFilter) out = out.filter((t) => (t.harnesses || []).includes(harnessFilter));
+  return out;
 }
 
 function nav(active) {
@@ -175,9 +203,9 @@ function nav(active) {
     <a href="/refresh">refresh now</a></div>`;
 }
 
-function renderBoard(areaFilter) {
+function renderBoard(areaFilter, harnessFilter) {
   const all = visibleThreads(loadRegistry());
-  const threads = areaFilter ? all.filter((t) => t.intent_area === areaFilter) : all;
+  const threads = applyFilters(all, areaFilter, harnessFilter);
 
   // Reverse flow order — Done at the top, Funnel at the bottom — so the eye
   // lands on finishing before starting. Done starts collapsed.
@@ -197,16 +225,17 @@ function renderBoard(areaFilter) {
     <header>
       <h1>AI Thread Board</h1>
       ${nav("/")}
-      <div class="meta">${threads.length} threads${areaFilter ? ` in ${esc(areaFilter)}` : ""} · auto-refreshes every 60s</div>
+      <div class="meta">${threads.length} threads${areaFilter ? ` in ${esc(areaFilter)}` : ""}${harnessFilter ? ` · ${esc(harnessFilter)} only` : ""} · auto-refreshes every 60s</div>
     </header>
-    <div class="chips">${chipBar(all, areaFilter, "/")}</div>
+    <div class="chips">${chipBar(all, areaFilter, "/", harnessFilter)}</div>
+    <div class="chips chips-harness">${harnessChipBar(all, harnessFilter, "/", areaFilter)}</div>
     ${sections || "<p>No threads.</p>"}
   `);
 }
 
-function renderKanban(areaFilter, ipsum) {
+function renderKanban(areaFilter, ipsum, harnessFilter) {
   const all = visibleThreads(loadRegistry());
-  const threads = (areaFilter && !ipsum) ? all.filter((t) => t.intent_area === areaFilter) : all;
+  const threads = ipsum ? all : applyFilters(all, areaFilter, harnessFilter);
 
   const lanes = STAGE_ORDER.map((stage) => {
     const items = threads
@@ -264,10 +293,11 @@ function renderKanban(areaFilter, ipsum) {
     <header>
       <h1>AI Thread Board — Kanban</h1>
       ${nav("/kanban")}
-      <div class="meta">${threads.length} threads${areaFilter ? ` in ${esc(areaFilter)}` : ""} ·
+      <div class="meta">${threads.length} threads${areaFilter ? ` in ${esc(areaFilter)}` : ""}${harnessFilter ? ` · ${esc(harnessFilter)} only` : ""} ·
         drag a card to another lane to change its stage</div>
     </header>
-    <div class="chips">${chipBar(all, areaFilter, "/kanban")}</div>
+    <div class="chips">${chipBar(all, areaFilter, "/kanban", harnessFilter)}</div>
+    <div class="chips chips-harness">${harnessChipBar(all, harnessFilter, "/kanban", areaFilter)}</div>
     <div class="board" id="board">${lanes}</div>
     <div id="modal" class="modal-overlay" hidden>
       <div class="modal-box">
@@ -647,6 +677,9 @@ function page(title, body) {
   .modal-close { position: absolute; top: 4px; right: 12px; border: none; background: transparent; font-size: 24px; line-height: 1; cursor: pointer; color: #667; }
   .modal-box .card { margin: 0; }
   .chips { padding: 4px 20px 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .chips-harness { padding-top: 0; }
+  .chips-harness .chip { background: #f1f5f9; font-size: 11px; padding: 2px 9px; }
+  .chips-harness .chip.on { background: #0f172a; color: #fff; }
   .chip { font-size: 12px; padding: 3px 10px; border-radius: 12px; background: #e6e8ee; color: #334; text-decoration: none; }
   .chip.on { background: #2563eb; color: #fff; }
   .card { background: #fff; margin: 6px 24px; padding: 10px 14px; border-radius: 8px; border-left: 3px solid #c8cdd8; }

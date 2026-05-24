@@ -6,6 +6,9 @@ Thumbs.db
 # Local install scratch
 /.tmp/
 
+# Rendered from start-thread-board.vbs.template by install.ps1 — per-machine
+scripts/start-thread-board.vbs
+
 # Editor
 .vscode/
 .idea/
