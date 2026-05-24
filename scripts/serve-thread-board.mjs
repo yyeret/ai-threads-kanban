@@ -268,7 +268,7 @@ function renderKanban(areaFilter, ipsum, harnessFilter) {
          style="border-left-color:${areaColor(t.intent_area)}" title="${tip}">
         <span class="mini-title">${esc(truncate(title, 90))}</span>
         <span class="mini-foot">
-          <span class="mini-meta">${blk}${agePill(t)} <span class="mini-dim">${(t.harnesses || []).join("/")}</span></span>
+          <span class="mini-meta">${blk}${agePill(t)} <span class="mini-dim">${(t.harnesses || []).join("/")}${!ipsum && machineLabel(t) ? ` · ${esc(machineLabel(t))}` : ""}</span></span>
           ${acts}
         </span>
       </div>`;
@@ -419,6 +419,21 @@ function areaColor(area) {
   return palette[area] || "#94a3b8";
 }
 
+const LOCAL_MACHINE = os.hostname();
+// Short label for which machine(s) own a thread's sessions. Hide when the
+// only owner is the local machine — that's the common case and not worth
+// the visual noise. Show "X + 1 more" when multiple, "X" when remote-only.
+function machineLabel(t) {
+  const ms = (t.machines || []).filter(Boolean);
+  if (!ms.length) return "";
+  if (ms.length === 1) return ms[0] === LOCAL_MACHINE ? "" : ms[0];
+  const others = ms.filter((m) => m !== LOCAL_MACHINE);
+  if (!others.length) return `${ms.length} machines`;
+  return ms.includes(LOCAL_MACHINE)
+    ? `${others[0]}${others.length > 1 ? ` +${others.length - 1}` : ""} + local`
+    : `${others[0]}${others.length > 1 ? ` +${others.length - 1}` : ""}`;
+}
+
 function renderCard(t) {
   const s = (t.sessions || [])[0] || {};
   const aging = t.aging ? ` <span class="badge aging">&#9888; AGING &middot; ${esc(ageLabel(t))}</span>` : "";
@@ -445,7 +460,7 @@ function renderCard(t) {
       ${t.notes ? `<div class="notes">note: ${esc(t.notes)}</div>` : ""}
       ${nextStep}
       <div class="card-foot">
-        <span class="dim">${agePill(t)} ${esc(harness)} · ${esc(t.repo_key || "")}${t.session_count > 1 ? ` · ${t.session_count} sessions` : ""}</span>
+        <span class="dim">${agePill(t)} ${esc(harness)} · ${esc(t.repo_key || "")}${t.session_count > 1 ? ` · ${t.session_count} sessions` : ""}${machineLabel(t) ? ` · &#128187; ${esc(machineLabel(t))}` : ""}</span>
         <span class="actions">${continueBtn}${logLink}</span>
       </div>
     </div>`;
