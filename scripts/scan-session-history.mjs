@@ -54,7 +54,13 @@ function scanClaude() {
   for (const { json } of readJsonFiles(sessionsDir)) {
     if (json?.sessionId) liveByid.set(String(json.sessionId), json);
   }
-  const transcripts = walkFiles(projectsDir, (f) => f.toLowerCase().endsWith(".jsonl"));
+  const transcripts = walkFiles(projectsDir, (f) =>
+    f.toLowerCase().endsWith(".jsonl")
+    // Sub-agent invocations under <session>/subagents/agent-*.jsonl are
+    // sidechain transcripts, not user threads — they carry random codenames
+    // and clutter the board.
+    && !/[\\/]subagents[\\/]/i.test(f),
+  );
 
   return transcripts.flatMap((transcript) => {
     const sessionId = path.basename(transcript, ".jsonl");
@@ -69,7 +75,17 @@ function scanClaude() {
     // Skip transcripts with zero user turns — they're harness boilerplate
     // (SessionStart hook output only, no actual prompt) and never carry intent.
     if (!summary.userCount && !firstPrompt) return [];
-    const title = titleFrom(summary.slug || claudeTitleFromPrompt(firstPrompt) || `Claude ${shortId(sessionId)}`);
+    // Walk through the early user messages; pick the first one that yields a
+    // title with at least 3 words after our heuristics strip pastes/openers.
+    // summary.slug is Claude's auto-generated worktree codename — only used
+    // when no user message produces anything meaningful.
+    let chosen = "";
+    for (const raw of (summary.earlyUsers || [summary.firstUserRaw || firstPrompt])) {
+      const candidate = claudeTitleFromPrompt(raw);
+      if (candidate && candidate.split(/\s+/).length >= 3) { chosen = candidate; break; }
+      if (candidate && !chosen) chosen = candidate; // remember shorter fallback
+    }
+    const title = titleFrom(chosen || summary.slug || `Claude ${shortId(sessionId)}`);
     const evidence = compact([
       summary.slug ? `plan slug: ${summary.slug}` : "",
       firstPrompt ? `first prompt: ${truncate(firstPrompt, 160)}` : "",
@@ -346,9 +362,19 @@ function summarizeClaudeTranscript(file) {
     summary.lastTimestamp = item.timestamp || summary.lastTimestamp;
     summary.cwd = item.cwd || summary.cwd;
     summary.slug = item.slug || summary.slug;
-    if (item.type === "user" && item.message?.content && !summary.firstUser) {
-      const prompt = substantivePrompt(extractClaudeContent(item.message.content));
-      if (prompt) summary.firstUser = prompt;
+    if (item.type === "user" && item.message?.content) {
+      const raw = extractClaudeContent(item.message.content);
+      const prompt = substantivePrompt(raw);
+      if (prompt) {
+        if (!summary.firstUser) {
+          summary.firstUser = prompt;
+          summary.firstUserRaw = raw;
+        }
+        // Keep the first 5 substantive user messages — title heuristics walk
+        // through them when the first one is a paste / one-word filename.
+        (summary.earlyUsers ||= []).push(raw);
+        if (summary.earlyUsers.length > 5) summary.earlyUsers.pop();
+      }
     }
     if (item.type === "user" && item.message?.content) {
       summary.userCount += 1;
@@ -593,11 +619,20 @@ function titleFrom(text) {
 
 // Turn a raw first user message into a short action-oriented title.
 // Claude has no equivalent of Codex's thread_name, so titles come from the
-// prompt itself. Strip conversational openers ("can you", "please", ...),
-// URLs, leading <tags>, and clip to the first sentence/clause.
+// prompt itself. The first message often opens with a paste (markdown doc,
+// git status, code fence) before the actual question — walk forward through
+// paragraphs to find the first one that looks like the user's own intent.
 function claudeTitleFromPrompt(text) {
-  let s = clean(text);
-  if (!s) return "";
+  let raw = String(text || "").trim();
+  if (!raw) return "";
+  // Take blocks separated by blank lines; pick the first that isn't a paste.
+  const blocks = raw.split(/\n\s*\n+/).map((s) => s.trim()).filter(Boolean);
+  let s = blocks.find((b) => !looksLikePaste(b)) || blocks[0];
+  // Within the chosen block, take the first non-paste line.
+  const firstLine = s.split(/\n/).map((l) => l.trim()).find((l) => l && !looksLikePaste(l)) || s;
+  s = clean(firstLine);
+  // Strip leading markdown heading markers (# / ## / ...) but keep the title.
+  s = s.replace(/^#+\s*/, "");
   s = s.replace(/^<[^>]+>\s*/g, "");
   s = s.replace(/https?:\/\/\S+/g, "").trim();
   // Drop conversational lead-ins so the verb starts the title.
@@ -609,6 +644,30 @@ function claudeTitleFromPrompt(text) {
   const m = s.match(/^[^.?!\n]{3,200}/);
   if (m) s = m[0];
   return clean(s);
+}
+
+// True if a paragraph looks like pasted content rather than the user's words:
+// git status / branch output, code fences, JSON/JSONL, log lines, "modified:",
+// or a long block whose first non-blank char is punctuation/markup.
+function looksLikePaste(block) {
+  const t = String(block || "").trim();
+  if (!t) return true;
+  if (/^```/.test(t)) return true;
+  if (/^On branch \S+/i.test(t)) return true;
+  if (/^(modified|new file|deleted|renamed):/im.test(t)) return true;
+  if (/^[{[]/.test(t) && t.length > 200) return true;       // JSON dump
+  if (/^\s*\d{4}-\d{2}-\d{2}T\d{2}/.test(t)) return true;   // ISO log line
+  if (/^[A-Za-z]:\\/.test(t) && t.includes("\\")) return true; // pasted Windows path
+  // Directory listing / multi-file paste: two or more filename-like tokens
+  // (something.ext) with no verb-shaped tokens around them.
+  const fileLikes = (t.match(/\b[\w-]+\.[a-z]{1,5}\b/g) || []).length;
+  if (fileLikes >= 3 && t.length < 400) return true;
+  // Single line that's nothing but a filename/slug — "AGENTS", "Article-draft",
+  // "Ai_leadership_filtered", "10-how-to-..." — no spaces, no verbs.
+  if (!/\s/.test(t) && /^[\w.\-]+$/.test(t)) return true;
+  // Trailing punctuation that looks like the start of a paste block.
+  if (/^Actions[/:\\]/.test(t)) return true;
+  return false;
 }
 
 function clean(text) {
