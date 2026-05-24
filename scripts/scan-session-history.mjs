@@ -595,7 +595,15 @@ function projectFromGeminiPath(file) {
 
 function extractClaudeContent(content) {
   if (typeof content === "string") return content;
-  if (Array.isArray(content)) return content.map((part) => part.text || part.content || "").join(" ");
+  if (Array.isArray(content)) {
+    // Skip tool_result parts — they carry harness error messages, not user intent.
+    // Only extract human-authored text blocks.
+    return content
+      .filter((part) => part.type !== "tool_result" && part.type !== "tool_use")
+      .map((part) => part.text || (typeof part.content === "string" ? part.content : "") || "")
+      .join(" ")
+      .trim();
+  }
   return "";
 }
 
@@ -627,10 +635,14 @@ function claudeTitleFromPrompt(text) {
   if (!raw) return "";
   // Take blocks separated by blank lines; pick the first that isn't a paste.
   const blocks = raw.split(/\n\s*\n+/).map((s) => s.trim()).filter(Boolean);
-  let s = blocks.find((b) => !looksLikePaste(b)) || blocks[0];
+  const goodBlock = blocks.find((b) => !looksLikePaste(b));
+  if (!goodBlock) return ""; // every block looks like tool output / paste — no usable title
+  let s = goodBlock;
   // Within the chosen block, take the first non-paste line.
   const firstLine = s.split(/\n/).map((l) => l.trim()).find((l) => l && !looksLikePaste(l)) || s;
   s = clean(firstLine);
+  // Strip leading line-number or "N #" prefix before heading markers.
+  s = s.replace(/^\d+\s+/, "");
   // Strip leading markdown heading markers (# / ## / ...) but keep the title.
   s = s.replace(/^#+\s*/, "");
   s = s.replace(/^<[^>]+>\s*/g, "");
@@ -656,8 +668,13 @@ function looksLikePaste(block) {
   if (/^On branch \S+/i.test(t)) return true;
   if (/^(modified|new file|deleted|renamed):/im.test(t)) return true;
   if (/^[{[]/.test(t) && t.length > 200) return true;       // JSON dump
+  if (/^\[object Object\]/.test(t)) return true;            // serialised JS object
   if (/^\s*\d{4}-\d{2}-\d{2}T\d{2}/.test(t)) return true;   // ISO log line
   if (/^[A-Za-z]:\\/.test(t) && t.includes("\\")) return true; // pasted Windows path
+  if (/^(File content \(|File does not exist|Exit code \d|InputValidationError|<tool_use_error>)/i.test(t)) return true; // tool error/size msgs
+  if (/^@\//.test(t)) return true;                           // @/path pasted file ref
+  // Code line: leading line-number + identifier, or "identifier = value" / "identifier(args)"
+  if (/^\d+\s+[a-z_$][\w$]*[\s(=<>!]/.test(t)) return true; // "153 const foo ="
   // Directory listing / multi-file paste: two or more filename-like tokens
   // (something.ext) with no verb-shaped tokens around them.
   const fileLikes = (t.match(/\b[\w-]+\.[a-z]{1,5}\b/g) || []).length;
@@ -692,6 +709,9 @@ function isSubstantivePrompt(text) {
     "# claude.md",
     "# context from my ide setup",
     "# files mentioned by the user",
+    "workspace context to honor",
+    "codebase and user instructions",
+    "<tool_use_error>",
   ];
   if (skipPrefixes.some((prefix) => cleaned.startsWith(prefix))) return false;
   // Codex/Claude inject repo instruction blocks as the first "user" turn.
