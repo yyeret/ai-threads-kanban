@@ -30,6 +30,23 @@ const STAGE_ORDER = [
 const LIST_ORDER = STAGE_ORDER;
 const MUTED_STAGES = new Set(["Funnel / Triage", "On Hold", "Done / Archive Candidates"]);
 
+// In-memory registry cache — loaded async at startup and on /refresh so
+// request handlers never block on a Drive readFileSync that can stall
+// indefinitely in a launchd (non-GUI) session.
+let _registryCache = [];
+async function reloadRegistryCache() {
+  try {
+    const text = await fs.promises.readFile(registryPath, "utf8");
+    _registryCache = text.split(/\r?\n/).filter((l) => l.trim())
+      .flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } })
+      .sort((a, b) => Date.parse(b.last_activity || 0) - Date.parse(a.last_activity || 0));
+    if (devMode) console.log(`[cache] loaded ${_registryCache.length} threads`);
+  } catch (err) {
+    if (devMode) console.error(`[cache] load failed: ${err.message}`);
+  }
+}
+reloadRegistryCache(); // warm the cache on startup; non-blocking
+
 const server = http.createServer((req, res) => {
   try {
     const url = new URL(req.url, `http://127.0.0.1:${port}`);
@@ -127,16 +144,22 @@ function handleSetStage(res, id, stage) {
   } catch {
     /* registry write already succeeded; board still reflects the change */
   }
+  reloadRegistryCache(); // async, non-blocking
   res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
 }
 
 function handleRefresh(res) {
+  // Scan + reconcile only make sense when the process can reach the primary
+  // registry (Drive). When running as a launchd agent the primary is
+  // inaccessible; the local mirror is kept current by stop-hook refreshes.
+  // We still try — if it fails the cached data stays valid.
   try {
     execFileSync(process.execPath, [path.join(scriptDir, "scan-session-history.mjs"), "--days", "30"], { stdio: "ignore" });
     execFileSync(process.execPath, [path.join(scriptDir, "reconcile-threads.mjs")], { stdio: "ignore" });
   } catch {
     /* ignore — board still serves the last good registry */
   }
+  reloadRegistryCache(); // async, non-blocking
   res.writeHead(303, { Location: "/" }).end();
 }
 
@@ -639,9 +662,7 @@ function flatten(content) {
 // --- helpers ---------------------------------------------------------------
 
 function loadRegistry() {
-  return readLines(registryPath)
-    .flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } })
-    .sort((a, b) => Date.parse(b.last_activity || 0) - Date.parse(a.last_activity || 0));
+  return _registryCache;
 }
 
 function findThread(id) {

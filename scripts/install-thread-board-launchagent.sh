@@ -47,7 +47,20 @@ fi
 SCRIPT="$REPO_ROOT/scripts/serve-thread-board.mjs"
 [[ -f "$SCRIPT" ]] || { echo "Missing $SCRIPT" >&2; exit 1; }
 
-mkdir -p "$HOME/Library/LaunchAgents"
+# The board server runs as a launchd agent which cannot access network FUSE
+# mounts (Google Drive, iCloud Drive, etc.) reliably. Point it at a local
+# mirror directory that refresh-thread-board.sh keeps up to date.
+# This is a *read path* override; scan/reconcile scripts invoked by the
+# stop-hook still write to the primary Drive registry via their own env.
+LOCAL_BOARD_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ai-threads-kanban"
+mkdir -p "$LOCAL_BOARD_DIR" "$HOME/Library/LaunchAgents"
+
+ENV_BLOCK="    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AGENT_THREADS_OUTPUT_DIR</key>
+        <string>$LOCAL_BOARD_DIR</string>
+    </dict>"
+
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -62,6 +75,7 @@ cat > "$PLIST" <<PLIST
         <string>--port</string>
         <string>$PORT</string>
     </array>
+$ENV_BLOCK
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
