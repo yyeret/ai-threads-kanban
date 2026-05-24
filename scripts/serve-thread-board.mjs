@@ -15,6 +15,7 @@ import { resolveRegistryDir } from "./lib/paths.mjs";
 const home = os.homedir();
 const args = parseArgs(process.argv.slice(2));
 const port = Number(args.port || process.env.THREAD_BOARD_PORT || 7878);
+const devMode = Boolean(args.dev || process.env.THREAD_BOARD_DEBUG || process.env.NODE_ENV === "development");
 const dir = resolveRegistryDir();
 const registryPath = path.join(dir, "active-threads.jsonl");
 const scriptDir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
@@ -32,9 +33,9 @@ const MUTED_STAGES = new Set(["Funnel / Triage", "On Hold", "Done / Archive Cand
 const server = http.createServer((req, res) => {
   try {
     const url = new URL(req.url, `http://127.0.0.1:${port}`);
-    if (url.pathname === "/") return sendHtml(res, renderBoard(url.searchParams.get("area"), url.searchParams.get("harness")));
-    if (url.pathname === "/kanban") return sendHtml(res, renderKanban(url.searchParams.get("area"), false, url.searchParams.get("harness")));
-    if (url.pathname === "/kanban-ipsum") return sendHtml(res, renderKanban(null, true, null));
+    if (url.pathname === "/") return sendHtml(res, renderBoard(url.searchParams));
+    if (url.pathname === "/kanban") return sendHtml(res, renderKanban(url.searchParams));
+    if (url.pathname === "/kanban-ipsum") return sendHtml(res, renderKanban(null, true));
     if (url.pathname === "/continue") return handleContinue(res, url.searchParams.get("id"), url.searchParams.get("step"));
     if (url.pathname === "/log") return handleLog(res, url.searchParams.get("id"));
     if (url.pathname === "/card") return handleCard(res, url.searchParams.get("id"));
@@ -60,12 +61,17 @@ function handleContinue(res, id, withStep) {
   const ok = openTerminal(session.cwd || home, session.resume);
   // "Continue with next action" also puts the suggested step on the clipboard.
   if (withStep && t.next_step) copyToClipboard(t.next_step);
+  if (devMode) {
+    console.log(`[continue] ${ok ? "opened" : "failed"} id=${id} cwd=${session.cwd || home} command=${session.resume}`);
+  }
   res.writeHead(303, { Location: "/" }).end(ok ? "" : "Could not open a terminal");
 }
 
 function copyToClipboard(text) {
   try {
-    const p = spawn("clip", { stdio: ["pipe", "ignore", "ignore"] });
+    const p = process.platform === "darwin"
+      ? spawn("pbcopy", { stdio: ["pipe", "ignore", "ignore"] })
+      : spawn("clip", { stdio: ["pipe", "ignore", "ignore"] });
     p.stdin.write(text);
     p.stdin.end();
     return true;
@@ -138,6 +144,20 @@ function handleRefresh(res) {
 
 function openTerminal(cwd, command) {
   const useDir = cwd && fs.existsSync(cwd) ? cwd : home;
+  if (process.platform === "darwin") {
+    const shellCommand = `cd ${shellQuote(useDir)} && ${command}`;
+    try {
+      const child = spawn("osascript", [
+        "-e", `tell application "Terminal" to do script ${JSON.stringify(shellCommand)}`,
+        "-e", 'tell application "Terminal" to activate',
+      ], { detached: true, stdio: devMode ? "inherit" : "ignore" });
+      child.unref();
+      return true;
+    } catch (err) {
+      if (devMode) console.error(`[continue] macOS terminal launch failed: ${err.message}`);
+      return false;
+    }
+  }
   // Prefer Windows Terminal; fall back to a detached cmd window.
   for (const attempt of [
     () => spawn("wt.exe", ["-d", useDir, "cmd", "/k", command], { detached: true, stdio: "ignore" }),
@@ -151,49 +171,78 @@ function openTerminal(cwd, command) {
       /* try next */
     }
   }
+  if (devMode) console.error("[continue] no supported terminal launcher succeeded");
   return false;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 // --- rendering -------------------------------------------------------------
 
-// Build a querystring keeping the other filter intact so toggling one doesn't
-// drop the other.
-function buildQs(basePath, params) {
-  const entries = Object.entries(params).filter(([, v]) => v);
-  if (!entries.length) return basePath;
-  return `${basePath}?${entries.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&")}`;
+function queryPath(basePath, params) {
+  const query = Object.entries(params)
+    .filter(([, value]) => value)
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join("&");
+  return query ? `${basePath}?${query}` : basePath;
 }
 
-function chipBar(all, areaFilter, basePath, harnessFilter) {
+function filterThreads(all, { areaFilter, harnessFilter, machineFilter }) {
+  return all.filter((t) => (
+    (!areaFilter || t.intent_area === areaFilter)
+    && (!harnessFilter || (t.harnesses || []).includes(harnessFilter))
+    && (!machineFilter || (t.machines || []).includes(machineFilter))
+  ));
+}
+
+function filterSummary(threads, { areaFilter, harnessFilter, machineFilter }) {
+  const parts = [];
+  if (areaFilter) parts.push(`in ${esc(areaFilter)}`);
+  if (harnessFilter) parts.push(`via ${esc(harnessFilter)}`);
+  if (machineFilter) parts.push(`on ${esc(machineFilter)}`);
+  return `${threads.length} threads${parts.length ? ` ${parts.join(" ")}` : ""}`;
+}
+
+function areaChipBar(all, areaFilter, harnessFilter, machineFilter, basePath) {
   const areas = [...new Set(all.map((t) => t.intent_area || "Other / Unsorted"))].sort();
-  const link = (area) => buildQs(basePath, { area, harness: harnessFilter });
+  const scoped = filterThreads(all, { harnessFilter, machineFilter });
+  const q = (a) => queryPath(basePath, { area: a || "", harness: harnessFilter || "", machine: machineFilter || "" });
   return [
-    `<a class="chip${areaFilter ? "" : " on"}" href="${buildQs(basePath, { harness: harnessFilter })}">All (${all.length})</a>`,
+    `<a class="chip${areaFilter ? "" : " on"}" href="${q("")}">All areas (${scoped.length})</a>`,
     ...areas.map((a) => {
-      const n = all.filter((t) => t.intent_area === a).length;
-      return `<a class="chip${areaFilter === a ? " on" : ""}" href="${link(a)}">${esc(a)} (${n})</a>`;
+      const n = scoped.filter((t) => t.intent_area === a).length;
+      return `<a class="chip${areaFilter === a ? " on" : ""}" href="${q(a)}">${esc(a)} (${n})</a>`;
     }),
   ].join("");
 }
 
 // Harness filter: a thread matches a harness if any of its sessions used it.
-function harnessChipBar(all, harnessFilter, basePath, areaFilter) {
+function harnessChipBar(all, harnessFilter, areaFilter, machineFilter, basePath) {
   const harnesses = [...new Set(all.flatMap((t) => t.harnesses || []))].sort();
-  const link = (h) => buildQs(basePath, { area: areaFilter, harness: h });
+  const scoped = filterThreads(all, { areaFilter, machineFilter });
+  const q = (h) => queryPath(basePath, { area: areaFilter || "", harness: h || "", machine: machineFilter || "" });
   return [
-    `<a class="chip${harnessFilter ? "" : " on"}" href="${buildQs(basePath, { area: areaFilter })}">All harnesses (${all.length})</a>`,
+    `<a class="chip${harnessFilter ? "" : " on"}" href="${q("")}">All harnesses (${scoped.length})</a>`,
     ...harnesses.map((h) => {
-      const n = all.filter((t) => (t.harnesses || []).includes(h)).length;
-      return `<a class="chip${harnessFilter === h ? " on" : ""}" href="${link(h)}">${esc(h)} (${n})</a>`;
+      const n = scoped.filter((t) => (t.harnesses || []).includes(h)).length;
+      return `<a class="chip${harnessFilter === h ? " on" : ""}" href="${q(h)}">${esc(h)} (${n})</a>`;
     }),
   ].join("");
 }
 
-function applyFilters(threads, areaFilter, harnessFilter) {
-  let out = threads;
-  if (areaFilter) out = out.filter((t) => t.intent_area === areaFilter);
-  if (harnessFilter) out = out.filter((t) => (t.harnesses || []).includes(harnessFilter));
-  return out;
+function machineChipBar(all, machineFilter, areaFilter, harnessFilter, basePath) {
+  const machines = [...new Set(all.flatMap((t) => t.machines || []))].sort();
+  const scoped = filterThreads(all, { areaFilter, harnessFilter });
+  const q = (m) => queryPath(basePath, { area: areaFilter || "", harness: harnessFilter || "", machine: m || "" });
+  return [
+    `<a class="chip${machineFilter ? "" : " on"}" href="${q("")}">All machines (${scoped.length})</a>`,
+    ...machines.map((m) => {
+      const n = scoped.filter((t) => (t.machines || []).includes(m)).length;
+      return `<a class="chip${machineFilter === m ? " on" : ""}" href="${q(m)}">${esc(m)} (${n})</a>`;
+    }),
+  ].join("");
 }
 
 function nav(active) {
@@ -203,9 +252,12 @@ function nav(active) {
     <a href="/refresh">refresh now</a></div>`;
 }
 
-function renderBoard(areaFilter, harnessFilter) {
+function renderBoard(searchParams) {
+  const areaFilter = searchParams.get("area") || "";
+  const harnessFilter = searchParams.get("harness") || "";
+  const machineFilter = searchParams.get("machine") || "";
   const all = visibleThreads(loadRegistry());
-  const threads = applyFilters(all, areaFilter, harnessFilter);
+  const threads = filterThreads(all, { areaFilter, harnessFilter, machineFilter });
 
   // Reverse flow order — Done at the top, Funnel at the bottom — so the eye
   // lands on finishing before starting. Done starts collapsed.
@@ -225,17 +277,21 @@ function renderBoard(areaFilter, harnessFilter) {
     <header>
       <h1>AI Thread Board</h1>
       ${nav("/")}
-      <div class="meta">${threads.length} threads${areaFilter ? ` in ${esc(areaFilter)}` : ""}${harnessFilter ? ` · ${esc(harnessFilter)} only` : ""} · auto-refreshes every 60s</div>
+      <div class="meta">${filterSummary(threads, { areaFilter, harnessFilter, machineFilter })} · auto-refreshes every 60s</div>
     </header>
-    <div class="chips">${chipBar(all, areaFilter, "/", harnessFilter)}</div>
-    <div class="chips chips-harness">${harnessChipBar(all, harnessFilter, "/", areaFilter)}</div>
+    <div class="chips">${areaChipBar(all, areaFilter, harnessFilter, machineFilter, "/")}</div>
+    <div class="chips chips-harness">${harnessChipBar(all, harnessFilter, areaFilter, machineFilter, "/")}</div>
+    <div class="chips">${machineChipBar(all, machineFilter, areaFilter, harnessFilter, "/")}</div>
     ${sections || "<p>No threads.</p>"}
   `);
 }
 
-function renderKanban(areaFilter, ipsum, harnessFilter) {
+function renderKanban(searchParams, ipsum) {
+  const areaFilter = ipsum ? "" : (searchParams.get("area") || "");
+  const harnessFilter = ipsum ? "" : (searchParams.get("harness") || "");
+  const machineFilter = ipsum ? "" : (searchParams.get("machine") || "");
   const all = visibleThreads(loadRegistry());
-  const threads = ipsum ? all : applyFilters(all, areaFilter, harnessFilter);
+  const threads = ipsum ? all : filterThreads(all, { areaFilter, harnessFilter, machineFilter });
 
   const lanes = STAGE_ORDER.map((stage) => {
     const items = threads
@@ -293,11 +349,12 @@ function renderKanban(areaFilter, ipsum, harnessFilter) {
     <header>
       <h1>AI Thread Board — Kanban</h1>
       ${nav("/kanban")}
-      <div class="meta">${threads.length} threads${areaFilter ? ` in ${esc(areaFilter)}` : ""}${harnessFilter ? ` · ${esc(harnessFilter)} only` : ""} ·
+      <div class="meta">${filterSummary(threads, { areaFilter, harnessFilter, machineFilter })} ·
         drag a card to another lane to change its stage</div>
     </header>
-    <div class="chips">${chipBar(all, areaFilter, "/kanban", harnessFilter)}</div>
-    <div class="chips chips-harness">${harnessChipBar(all, harnessFilter, "/kanban", areaFilter)}</div>
+    <div class="chips">${areaChipBar(all, areaFilter, harnessFilter, machineFilter, "/kanban")}</div>
+    <div class="chips chips-harness">${harnessChipBar(all, harnessFilter, areaFilter, machineFilter, "/kanban")}</div>
+    <div class="chips">${machineChipBar(all, machineFilter, areaFilter, harnessFilter, "/kanban")}</div>
     <div class="board" id="board">${lanes}</div>
     <div id="modal" class="modal-overlay" hidden>
       <div class="modal-box">

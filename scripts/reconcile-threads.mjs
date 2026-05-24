@@ -242,7 +242,7 @@ function dedupeSessions(group) {
 
 function loadScanCards(dir) {
   if (!fs.existsSync(dir)) return [];
-  const files = fs.readdirSync(dir).filter((f) => /^threads(\.[^.]+)?\.jsonl$/.test(f));
+  const files = fs.readdirSync(dir).filter((f) => /^threads(\..+)?\.jsonl$/.test(f));
   const machineFiles = files.filter((f) => f !== "threads.jsonl");
   const pick = machineFiles.length ? machineFiles : files; // avoid double-counting the alias
   const cards = [];
