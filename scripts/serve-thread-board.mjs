@@ -52,6 +52,7 @@ const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://127.0.0.1:${port}`);
     if (url.pathname === "/") return sendHtml(res, renderBoard(url.searchParams));
     if (url.pathname === "/kanban") return sendHtml(res, renderKanban(url.searchParams));
+    if (url.pathname === "/telemetry") return sendHtml(res, renderTelemetry(url.searchParams));
     if (url.pathname === "/kanban-ipsum") return sendHtml(res, renderKanban(null, true));
     if (url.pathname === "/continue") return handleContinue(res, url.searchParams.get("id"), url.searchParams.get("step"));
     if (url.pathname === "/log") return handleLog(res, url.searchParams.get("id"));
@@ -271,6 +272,7 @@ function machineChipBar(all, machineFilter, areaFilter, harnessFilter, basePath)
 function nav(active) {
   const link = (href, label) => `<a class="${active === href ? "navon" : ""}" href="${href}">${label}</a>`;
   return `<div class="nav">${link("/", "List view")} ${link("/kanban", "Kanban view")}
+    ${link("/telemetry", "Telemetry Insights")}
     ${link("/kanban-ipsum", "Shareable")} ·
     <a href="/refresh">refresh now</a></div>`;
 }
@@ -326,19 +328,22 @@ function renderKanban(searchParams, ipsum) {
       let tip = ipsum ? esc(ageLabel(t)) : `${esc(t.intent_area || "")} — ${esc(ageLabel(t))}`;
       if (!ipsum && t.next_step) tip += ` — Next: ${esc(t.next_step)}`;
       const blk = (!ipsum && t.blocked) ? '<span class="blk">BLOCKED</span> ' : "";
-      const drag = ipsum ? "" : ` draggable="true" data-id="${t.thread_id}"`;
+      const drag = (ipsum || t.isSkillMaintenance) ? "" : ` draggable="true" data-id="${t.thread_id}"`;
       const s0 = (t.sessions || [])[0] || {};
       let acts = "";
       if (!ipsum) {
         const a = [];
-        if (s0.resume) {
+        if (s0.resume && !t.isSkillMaintenance) {
           a.push(`<a class="mini-act" data-fetch href="/continue?id=${t.thread_id}" title="Continue this session" draggable="false">&#9654;</a>`);
           if (t.next_step) {
             a.push(`<a class="mini-act act-next" data-fetch href="/continue?id=${t.thread_id}&step=1" title="Continue with next action — also copies the suggested next step: ${esc(t.next_step)}" draggable="false">&#9197;</a>`);
           }
         }
-        if (s0.transcript_path) {
+        if (s0.transcript_path && !t.isSkillMaintenance) {
           a.push(`<a class="mini-act" href="/log?id=${t.thread_id}" title="Review the session log" draggable="false">&#128196;</a>`);
+        }
+        if (t.isSkillMaintenance) {
+          a.push(`<a class="mini-act" href="/telemetry" title="View telemetry insights" draggable="false" style="background:#ffe6dc; color:#ea580c; font-weight:bold;">&#128736; info</a>`);
         }
         if (a.length) acts = `<span class="mini-acts">${a.join("")}</span>`;
       }
@@ -519,20 +524,28 @@ function renderCard(t) {
   const aging = t.aging ? ` <span class="badge aging">&#9888; AGING &middot; ${esc(ageLabel(t))}</span>` : "";
   const blocked = t.blocked ? ' <span class="badge blocked">&#9209; BLOCKED</span>' : "";
   const harness = (t.harnesses || []).join(", ");
-  const logLink = s.transcript_path
+  
+  const isMaint = t.isSkillMaintenance;
+  
+  const logLink = (!isMaint && s.transcript_path)
     ? `<a class="btn" href="/log?id=${t.thread_id}">&#128196; log</a>
        <a class="btn ghost" href="vscode://file/${encodeURI(s.transcript_path.replace(/\\/g, "/"))}">open in editor</a>`
     : "";
-  const continueBtn = s.resume
-    ? `<a class="btn go" href="/continue?id=${t.thread_id}${t.next_step ? "&step=1" : ""}" title="${t.next_step ? "Opens the session and copies the next-step prompt to your clipboard" : "Resume this session"}">&#9654; continue${t.next_step ? " + copy step" : ""}</a>`
-    : "";
+    
+  const continueBtn = isMaint
+    ? `<a class="btn go" href="/telemetry" style="background:#ea580c">&#128736; telemetry insights</a>`
+    : (s.resume ? `<a class="btn go" href="/continue?id=${t.thread_id}${t.next_step ? "&step=1" : ""}" title="${t.next_step ? "Opens the session and copies the next-step prompt to your clipboard" : "Resume this session"}">&#9654; continue${t.next_step ? " + copy step" : ""}</a>` : "");
+    
   const nextStep = t.next_step
     ? `<div class="nextstep"><span class="ns-label">&#9654; Next step</span> ${esc(t.next_step)}</div>`
     : "";
+    
+  const titleText = isMaint ? `&#128736; ${esc(t.title)}` : esc(t.display_title || t.title);
+  
   return `
     <div class="card${t.aging ? " is-aging" : ""}" id="t-${t.thread_id}">
       <div class="card-head">
-        <span class="title">${esc(t.display_title || t.title)}</span>${blocked}${aging}
+        <span class="title">${titleText}</span>${blocked}${aging}
         <span class="badge area">${esc(t.intent_area || "Other / Unsorted")}</span>
       </div>
       <div class="intent">${esc(truncate(t.outcome_intent, 240))}</div>
@@ -693,11 +706,58 @@ function agePill(t) {
 // Done-stage threads with staleness > 14 days are also hidden automatically.
 function visibleThreads(threads) {
   const cutoffHours = 14 * 24;
-  return threads.filter((t) => {
+  const filtered = threads.filter((t) => {
     if (t.status === "archived") return false;
     if (t.stage === "Done / Archive Candidates" && (t.staleness_hours || 0) > cutoffHours) return false;
     return true;
   });
+
+  // Inject synthetic skill maintenance cards if telemetry has friction!
+  try {
+    const events = loadTelemetryEvents();
+    if (events && events.length) {
+      const activeEvents = events.filter((ev) => 
+        ev.confidence === "confirmed" && 
+        ["transcript_skill_path", "hook_tool_read", "hook_tool_operation"].includes(ev.evidence_source) &&
+        !isPlaceholderSkill(ev.skill_name)
+      );
+      
+      const skillStats = {};
+      activeEvents.forEach((ev) => {
+        const s = ev.skill_name;
+        if (!skillStats[s]) skillStats[s] = { total: 0, failed: 0, friction: 0, harnesses: new Set() };
+        skillStats[s].total++;
+        if (ev.outcome === "failed") skillStats[s].failed++;
+        if (ev.friction_reasons && ev.friction_reasons.length) skillStats[s].friction += ev.friction_reasons.length;
+        if (ev.harness) skillStats[s].harnesses.add(ev.harness);
+      });
+      
+      Object.entries(skillStats).forEach(([skill, stat]) => {
+        if (stat.failed > 0 || stat.friction >= 2) {
+          // Generate a candidate skill maintenance card
+          filtered.push({
+            thread_id: `skill-maint-${skill}`,
+            title: `[SKILL MAINTENANCE] Improve '${skill}'`,
+            display_title: `[SKILL MAINTENANCE] Improve '${skill}'`,
+            intent_area: "Skill Library & Agent Infra",
+            outcome_intent: `Telemetry has detected active friction in the '${skill}' skill. Click below to view the detailed telemetry dashboard and plan optimizations.`,
+            where_it_stands: `Friction score: ${stat.friction}. Failures: ${stat.failed}.`,
+            stage: "Funnel / Triage",
+            harnesses: Array.from(stat.harnesses),
+            session_count: stat.total,
+            staleness_hours: 0,
+            aging: false,
+            blocked: false,
+            isSkillMaintenance: true,
+            notes: `Friction signals present in ${stat.total} active-use sessions.`
+          });
+        }
+      });
+    }
+  } catch (err) {
+    // Silently proceed on error
+  }
+  return filtered;
 }
 
 function readLines(file) {
@@ -820,5 +880,296 @@ function parseArgs(argv) {
     }
   }
   return out;
+}
+
+
+// --- Skill Telemetry Integration (Insights & Funnel) -------------------------
+
+function resolveMemoryRoot() {
+  const env = process.env.AI_AGENT_MEMORY_ROOT || process.env.AGENT_MEMORY_ROOT;
+  if (env) return path.resolve(env);
+  const configPath = path.join(os.homedir(), ".config", "ai-skills", "agent-memory-root");
+  if (fs.existsSync(configPath)) {
+    const root = fs.readFileSync(configPath, "utf8").trim();
+    if (root) return path.resolve(root);
+  }
+  const regDir = resolveRegistryDir();
+  const parent = path.dirname(path.dirname(regDir));
+  if (fs.existsSync(path.join(parent, "skill-telemetry"))) {
+    return parent;
+  }
+  return path.join(os.homedir(), ".agent-memory");
+}
+
+function loadTelemetryEvents() {
+  const memoryRoot = resolveMemoryRoot();
+  const file = path.join(memoryRoot, "skill-telemetry", "events.jsonl");
+  if (!fs.existsSync(file)) return [];
+  try {
+    const text = fs.readFileSync(file, "utf8");
+    const events = [];
+    const seen = new Set();
+    text.split(/\r?\n/).forEach((line) => {
+      if (!line.trim()) return;
+      try {
+        const ev = JSON.parse(line);
+        const key = ev.event_id || `${ev.session_id}-${ev.skill_name}-${ev.evidence_source}-${ev.sequence_index}-${ev.captured_at}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          events.push(ev);
+        }
+      } catch (err) {}
+    });
+    return events;
+  } catch (err) {
+    return [];
+  }
+}
+
+function isPlaceholderSkill(skill) {
+  if (!skill) return true;
+  const s = skill.trim();
+  return (
+    s.includes("<") || s.includes(">") || s.includes("{") || s.includes("}") ||
+    s.includes("$") || s.includes("(") || s.includes(")") || s.includes("_") ||
+    s === "unknown" || s === "default"
+  );
+}
+
+function renderTelemetry(searchParams) {
+  const events = loadTelemetryEvents();
+  const allKnown = new Set();
+  
+  try {
+    const skillsDir = path.join(os.homedir(), "Github", "ai-skill-library", "skills");
+    if (fs.existsSync(skillsDir)) {
+      fs.readdirSync(skillsDir).forEach((name) => {
+        if (fs.statSync(path.join(skillsDir, name)).isDirectory() && fs.existsSync(path.join(skillsDir, name, "SKILL.md"))) {
+          allKnown.add(name);
+        }
+      });
+    }
+  } catch (err) {}
+
+  const seen = new Set();
+  const deduped = [];
+  let duplicates = 0;
+  events.forEach((ev) => {
+    const key = ev.event_id || `${ev.session_id}-${ev.skill_name}-${ev.evidence_source}-${ev.sequence_index}-${ev.captured_at}`;
+    if (seen.has(key)) {
+      duplicates++;
+    } else {
+      seen.add(key);
+      deduped.push(ev);
+    }
+  });
+
+  const CONFIRMED_SOURCES = new Set(["transcript_skill_path", "hook_tool_read", "hook_tool_operation"]);
+  const activeEvents = deduped.filter((ev) => 
+    ev.confidence === "confirmed" && 
+    CONFIRMED_SOURCES.has(ev.evidence_source) &&
+    !isPlaceholderSkill(ev.skill_name)
+  );
+
+  const activeSessions = new Set(deduped.map((ev) => ev.session_id).filter(Boolean));
+  const activeSkills = new Set(activeEvents.map((ev) => ev.skill_name).filter(Boolean));
+
+  const harnessCounts = {};
+  deduped.forEach((ev) => {
+    const h = ev.harness || "unknown";
+    harnessCounts[h] = (harnessCounts[h] || 0) + 1;
+  });
+
+  const skillStats = {};
+  activeEvents.forEach((ev) => {
+    const s = ev.skill_name;
+    if (!skillStats[s]) {
+      skillStats[s] = {
+        name: s,
+        events: 0,
+        sessions: new Set(),
+        repos: new Set(),
+        harnesses: new Set(),
+        failed: 0,
+        frictionReasons: [],
+        partialUse: false
+      };
+    }
+    const stat = skillStats[s];
+    stat.events++;
+    if (ev.session_id) stat.sessions.add(ev.session_id);
+    if (ev.repo) stat.repos.add(ev.repo);
+    if (ev.harness) stat.harnesses.add(ev.harness);
+    if (ev.outcome === "failed") stat.failed++;
+    if (ev.friction_reasons && ev.friction_reasons.length) {
+      stat.frictionReasons.push(...ev.friction_reasons);
+    }
+    if (ev.partial_use) stat.partialUse = true;
+  });
+
+  const activeList = Object.values(skillStats).map((stat) => {
+    let action = "keep";
+    if (stat.failed > 0 || stat.frictionReasons.length >= 2) {
+      action = "improve";
+    } else if (stat.partialUse) {
+      action = "split or bundle review";
+    } else if (stat.sessions.size >= 2) {
+      action = "keep and watch";
+    } else {
+      action = "ignore-for-now";
+    }
+    return {
+      name: stat.name,
+      events: stat.events,
+      sessions: stat.sessions.size,
+      repos: Array.from(stat.repos).join(", "),
+      harnesses: Array.from(stat.harnesses).join(", "),
+      action: action,
+      failures: stat.failed,
+      friction: stat.frictionReasons.length
+    };
+  }).sort((a, b) => b.sessions - a.sessions || b.events - a.events);
+
+  const unusedList = Array.from(allKnown).filter((name) => !skillStats[name]).sort();
+
+  const top10 = activeList.slice(0, 10);
+  const chartHeight = Math.max(100, top10.length * 36 + 20);
+  let svgChart = `<svg width="100%" height="${chartHeight}" viewBox="0 0 600 ${chartHeight}" style="background:#fff; border-radius:8px; padding:10px; box-sizing:border-box;">`;
+  if (top10.length === 0) {
+    svgChart += `<text x="300" y="${chartHeight / 2}" text-anchor="middle" fill="#667" font-size="14">No active skill usage data yet</text>`;
+  } else {
+    const maxSessions = Math.max(...top10.map((d) => d.sessions), 1);
+    top10.forEach((d, idx) => {
+      const y = idx * 36 + 20;
+      const barWidth = Math.max(10, (d.sessions / maxSessions) * 360);
+      svgChart += `
+        <text x="10" y="${y + 16}" fill="#1a1a2e" font-size="12" font-weight="600">${esc(truncate(d.name, 22))}</text>
+        <rect x="160" y="${y}" width="${barWidth}" height="20" rx="4" fill="${d.action === "improve" ? "#ea580c" : "#2563eb"}"></rect>
+        <text x="${160 + barWidth + 10}" y="${y + 15}" fill="#667" font-size="11" font-weight="600">${d.sessions} ses (${d.events} ev)</text>
+      `;
+    });
+  }
+  svgChart += `</svg>`;
+
+  const totalHarnessEvents = Object.values(harnessCounts).reduce((a, b) => a + b, 0) || 1;
+  const harnessHtml = Object.entries(harnessCounts).sort((a,b) => b[1] - a[1]).map(([h, c]) => {
+    const pct = Math.round((c / totalHarnessEvents) * 100);
+    let color = "#2563eb";
+    if (h === "claude-code") color = "#c026d3";
+    if (h === "gemini") color = "#16a34a";
+    if (h === "antigravity") color = "#ea580c";
+    return `
+      <div style="margin-bottom:8px;">
+        <div style="display:flex; justify-content:space-between; font-size:11px; font-weight:600; margin-bottom:2px;">
+          <span>${esc(h)}</span>
+          <span>${c} events (${pct}%)</span>
+        </div>
+        <div style="width:100%; height:8px; background:#dde; border-radius:4px; overflow:hidden;">
+          <div style="width:${pct}%; height:100%; background:${color}; border-radius:4px;"></div>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const activeRowsHtml = activeList.map((stat) => {
+    let badgeColor = "#16a34a";
+    if (stat.action === "improve") badgeColor = "#ea580c";
+    if (stat.action === "split or bundle review") badgeColor = "#9333ea";
+    if (stat.action === "ignore-for-now") badgeColor = "#94a3b8";
+    
+    const actionBadge = `<span class="badge" style="background:${badgeColor}; color:#fff; font-weight:600; font-size:10px;">${esc(stat.action)}</span>`;
+    const fSig = (stat.failures > 0 || stat.friction > 0)
+      ? `<span style="color:#b91c1c; font-weight:600;">&#9888; ${stat.failures} fail, ${stat.friction} fric</span>`
+      : `<span style="color:#16a34a;">clean</span>`;
+      
+    return `
+      <tr style="border-bottom:1px solid #e2e8f0;">
+        <td style="padding:10px 16px; font-weight:600; font-size:13px;">${esc(stat.name)}</td>
+        <td style="padding:10px 16px; text-align:center;">${stat.sessions}</td>
+        <td style="padding:10px 16px; text-align:center;">${stat.events}</td>
+        <td style="padding:10px 16px; font-size:11px; color:#556;">${esc(stat.harnesses)}</td>
+        <td style="padding:10px 16px; text-align:center;">${fSig}</td>
+        <td style="padding:10px 16px; text-align:center;">${actionBadge}</td>
+      </tr>
+    `;
+  }).join("");
+
+  const unusedHtml = unusedList.map((name) => `
+    <span class="badge" style="background:#e2e8f0; color:#475569; margin:3px; display:inline-block; font-size:12px;">${esc(name)}</span>
+  `).join("") || "_No unused skills detected._";
+
+  const body = `
+    <header style="padding:18px 24px 8px;">
+      <h1>Skill Telemetry Insights</h1>
+      ${nav("/telemetry")}
+      <div class="meta">Analyses of local event stream · unified cross-machine data</div>
+    </header>
+
+    <div class="chips" style="padding: 10px 24px; display:block;">
+      <!-- Dashboard Stats cards -->
+      <div style="display:flex; gap:16px; width:100%; flex-wrap:wrap; margin-bottom:20px;">
+        <div style="flex:1; min-width:140px; background:#fff; padding:12px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.1); box-sizing:border-box;">
+          <div style="font-size:10px; text-transform:uppercase; color:#667; font-weight:600; letter-spacing:.02em;">Raw Events</div>
+          <div style="font-size:24px; font-weight:700; color:#1a1a2e; margin-top:4px;">${events.length}</div>
+        </div>
+        <div style="flex:1; min-width:140px; background:#fff; padding:12px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.1); box-sizing:border-box;">
+          <div style="font-size:10px; text-transform:uppercase; color:#667; font-weight:600; letter-spacing:.02em;">Deduplicated</div>
+          <div style="font-size:24px; font-weight:700; color:#1a1a2e; margin-top:4px;">${deduped.length}</div>
+        </div>
+        <div style="flex:1; min-width:140px; background:#fff; padding:12px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.1); box-sizing:border-box;">
+          <div style="font-size:10px; text-transform:uppercase; color:#667; font-weight:600; letter-spacing:.02em;">Sessions Tracked</div>
+          <div style="font-size:24px; font-weight:700; color:#1a1a2e; margin-top:4px;">${activeSessions.size}</div>
+        </div>
+        <div style="flex:1; min-width:140px; background:#fff; padding:12px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.1); box-sizing:border-box;">
+          <div style="font-size:10px; text-transform:uppercase; color:#667; font-weight:600; letter-spacing:.02em;">Active Skills</div>
+          <div style="font-size:24px; font-weight:700; color:#1a1a2e; margin-top:4px;">${activeSkills.size}</div>
+        </div>
+      </div>
+
+      <!-- Charts & Visuals row -->
+      <div style="display:flex; gap:16px; width:100%; flex-wrap:wrap; margin-bottom:20px; box-sizing:border-box;">
+        <div style="flex:2; min-width:320px; box-sizing:border-box;">
+          <h3 style="font-size:12px; text-transform:uppercase; margin:0 0 8px; color:#556; letter-spacing:.03em;">Top Skills Portfolio (by sessions)</h3>
+          ${svgChart}
+        </div>
+        <div style="flex:1; min-width:240px; background:#fff; border-radius:8px; padding:16px; box-sizing:border-box; box-shadow:0 1px 3px rgba(0,0,0,.1);">
+          <h3 style="font-size:12px; text-transform:uppercase; margin:0 0 12px; color:#556; letter-spacing:.03em;">Harness Distribution</h3>
+          ${harnessHtml}
+        </div>
+      </div>
+
+      <!-- Active use Table -->
+      <div style="width:100%; margin-bottom:20px;">
+        <h3 style="font-size:12px; text-transform:uppercase; margin:0 0 8px; color:#556; letter-spacing:.03em;">Active Confirmed Usage Portfolio</h3>
+        <div style="background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.1); width:100%;">
+          <table style="width:100%; border-collapse:collapse; text-align:left; box-sizing:border-box;">
+            <thead>
+              <tr style="background:#f1f5f9; border-bottom:1px solid #e2e8f0; font-size:11px; text-transform:uppercase; color:#475569;">
+                <th style="padding:10px 16px;">Skill Name</th>
+                <th style="padding:10px 16px; text-align:center;">Sessions</th>
+                <th style="padding:10px 16px; text-align:center;">Events</th>
+                <th style="padding:10px 16px;">Harnesses</th>
+                <th style="padding:10px 16px; text-align:center;">Friction</th>
+                <th style="padding:10px 16px; text-align:center;">Suggested Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${activeRowsHtml || `<tr><td colspan="6" style="padding:20px; text-align:center; color:#667;">No active skill usage detected yet.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Unused skills list -->
+      <div style="width:100%; background:#fff; border-radius:8px; padding:16px; margin-bottom:20px; box-sizing:border-box; box-shadow:0 1px 3px rgba(0,0,0,.1);">
+        <h3 style="font-size:12px; text-transform:uppercase; margin:0 0 8px; color:#556; letter-spacing:.03em;">No Confirmed Active Use (${unusedList.length} skills)</h3>
+        <p style="font-size:12px; color:#556; margin:0 0 10px;">These skills exist in the library but have not recorded active telemetry sessions. Consider for review or potential retirement.</p>
+        <div style="max-height:160px; overflow-y:auto; padding:6px; border:1px solid #e2e8f0; border-radius:6px; background:#f8fafc;">
+          ${unusedHtml}
+        </div>
+      </div>
+    </div>
+  `;
+  return page("Skill Telemetry Insights", body);
 }
 
