@@ -34,4 +34,31 @@ if [ -n "$REGISTRY_DIR" ] && [ -f "$REGISTRY_DIR/active-threads.jsonl" ]; then
   cp "$REGISTRY_DIR/active-threads.jsonl" "$LOCAL_BOARD_DIR/active-threads.jsonl" 2>/dev/null || true
 fi
 
+# Mirror the telemetry events file as well so the board server's /telemetry page works
+TELEMETRY_EVENTS_FILE="$("$NODE" -e "
+const f=require('fs');
+const path=require('path');
+const os=require('os');
+function resolveMemoryRoot() {
+  const env = process.env.AI_AGENT_MEMORY_ROOT || process.env.AGENT_MEMORY_ROOT;
+  if (env) return env;
+  const configPath = path.join(os.homedir(), '.config', 'ai-skills', 'agent-memory-root');
+  if (f.existsSync(configPath)) {
+    const root = f.readFileSync(configPath, 'utf8').trim();
+    if (root) return root;
+  }
+  return path.join(os.homedir(), '.agent-memory');
+}
+const eventsFile = path.join(resolveMemoryRoot(), 'skill-telemetry', 'events.jsonl');
+if (f.existsSync(eventsFile)) {
+  process.stdout.write(eventsFile);
+}
+" 2>/dev/null)"
+
+if [ -n "$TELEMETRY_EVENTS_FILE" ] && [ -f "$TELEMETRY_EVENTS_FILE" ]; then
+  mkdir -p "$LOCAL_BOARD_DIR/skill-telemetry" 2>/dev/null || true
+  cp "$TELEMETRY_EVENTS_FILE" "$LOCAL_BOARD_DIR/skill-telemetry/events.jsonl" 2>/dev/null || true
+fi
+
 exit 0
+

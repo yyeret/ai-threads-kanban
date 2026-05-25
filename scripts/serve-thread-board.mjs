@@ -894,6 +894,9 @@ function resolveMemoryRoot() {
     if (root) return path.resolve(root);
   }
   const regDir = resolveRegistryDir();
+  if (fs.existsSync(path.join(regDir, "skill-telemetry"))) {
+    return regDir;
+  }
   const parent = path.dirname(path.dirname(regDir));
   if (fs.existsSync(path.join(parent, "skill-telemetry"))) {
     return parent;
