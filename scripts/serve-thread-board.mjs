@@ -304,9 +304,9 @@ function renderBoard(searchParams) {
       ${nav("/")}
       <div class="meta">${filterSummary(threads, { areaFilter, harnessFilter, machineFilter })} · auto-refreshes every 60s</div>
     </header>
-    <div class="chips">${areaChipBar(all, areaFilter, harnessFilter, machineFilter, "/")}</div>
-    <div class="chips chips-harness">${harnessChipBar(all, harnessFilter, areaFilter, machineFilter, "/")}</div>
-    <div class="chips">${machineChipBar(all, machineFilter, areaFilter, harnessFilter, "/")}</div>
+    <div class="chips">${areaChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), areaFilter, harnessFilter, machineFilter, "/")}</div>
+    <div class="chips chips-harness">${harnessChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), harnessFilter, areaFilter, machineFilter, "/")}</div>
+    <div class="chips">${machineChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), machineFilter, areaFilter, harnessFilter, "/")}</div>
     ${sections || "<p>No threads.</p>"}
   `);
 }
@@ -380,9 +380,9 @@ function renderKanban(searchParams, ipsum) {
       <div class="meta">${filterSummary(threads, { areaFilter, harnessFilter, machineFilter })} ·
         drag a card to another lane to change its stage</div>
     </header>
-    <div class="chips">${areaChipBar(all, areaFilter, harnessFilter, machineFilter, "/kanban")}</div>
-    <div class="chips chips-harness">${harnessChipBar(all, harnessFilter, areaFilter, machineFilter, "/kanban")}</div>
-    <div class="chips">${machineChipBar(all, machineFilter, areaFilter, harnessFilter, "/kanban")}</div>
+    <div class="chips">${areaChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), areaFilter, harnessFilter, machineFilter, "/kanban")}</div>
+    <div class="chips chips-harness">${harnessChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), harnessFilter, areaFilter, machineFilter, "/kanban")}</div>
+    <div class="chips">${machineChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), machineFilter, areaFilter, harnessFilter, "/kanban")}</div>
     <div class="board" id="board">${lanes}</div>
     <div id="modal" class="modal-overlay" hidden>
       <div class="modal-box">
