@@ -689,12 +689,15 @@ function agePill(t) {
   return `<span class="age age-${staleTier(t)}">${esc(ageLabel(t))}</span>`;
 }
 
-// Hide threads that have been done for more than 14 days — long-archived noise.
+// Archived threads are permanently off the board.
+// Done-stage threads with staleness > 14 days are also hidden automatically.
 function visibleThreads(threads) {
   const cutoffHours = 14 * 24;
-  return threads.filter((t) => !(
-    t.stage === "Done / Archive Candidates" && (t.staleness_hours || 0) > cutoffHours
-  ));
+  return threads.filter((t) => {
+    if (t.status === "archived") return false;
+    if (t.stage === "Done / Archive Candidates" && (t.staleness_hours || 0) > cutoffHours) return false;
+    return true;
+  });
 }
 
 function readLines(file) {
