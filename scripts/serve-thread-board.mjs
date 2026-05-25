@@ -661,6 +661,9 @@ function extractMessage(o) {
   // Gemini
   if (o.type === "user" && o.content) return { role: "user", text: flatten(o.content) };
   if ((o.type === "gemini" || o.type === "model") && o.content) return { role: "assistant", text: flatten(o.content) };
+  // Antigravity
+  if (o.type === "USER_INPUT" && o.content) return { role: "user", text: o.content };
+  if (o.type === "PLANNER_RESPONSE" && o.content && o.source === "MODEL") return { role: "assistant", text: o.content };
   return null;
 }
 

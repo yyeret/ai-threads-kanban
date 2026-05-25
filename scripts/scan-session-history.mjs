@@ -29,6 +29,7 @@ const cards = [
   ...scanClaude(),
   ...scanCodex(),
   ...scanGemini(),
+  ...scanAntigravity(),
 ].sort((a, b) => new Date(b.lastActivity).getTime() - new Date(a.lastActivity).getTime());
 
 fs.mkdirSync(outputDir, { recursive: true });
@@ -227,6 +228,141 @@ function scanGemini() {
       signals: { ...summary, firstPrompt, latest },
     })];
   });
+}
+
+function scanAntigravity() {
+  const geminiDir = path.join(home, ".gemini");
+  const antigravityDir = path.join(geminiDir, "antigravity");
+  const brainDir = path.join(antigravityDir, "brain");
+
+  if (!fs.existsSync(brainDir)) return [];
+
+  return walkFiles(brainDir, (file) => /[\\/]\.system_generated[\\/]logs[\\/]transcript\.jsonl$/i.test(file)).flatMap((file) => {
+    const summary = summarizeAntigravityTranscript(file);
+    if (!summary.sessionId) return [];
+
+    const lastActivity = summary.lastTimestamp || fileMtime(file);
+    if (new Date(lastActivity).getTime() < cutoff) return [];
+
+    // Skip transcripts with zero user turns
+    if (!summary.userCount && !summary.firstUser) return [];
+
+    const firstPrompt = clean(summary.firstUser || "");
+    const latest = clean(summary.lastAssistant || summary.lastUser || "");
+    const title = titleFrom(summary.topicTitle || firstPrompt || `Antigravity ${shortId(summary.sessionId)}`);
+    const cwd = summary.cwd || "";
+
+    const evidence = compact([
+      firstPrompt ? `first prompt: ${truncate(firstPrompt, 160)}` : "",
+      latest ? `latest: ${truncate(latest, 180)}` : "",
+      summary.toolCount ? `${summary.toolCount} tool events` : "",
+    ]);
+
+    return [makeCard({
+      harness: "Antigravity",
+      sessionId: summary.sessionId,
+      title,
+      cwd,
+      source: file,
+      transcriptPath: file,
+      firstPrompt,
+      latest,
+      lastActivity,
+      evidence,
+      resumeCommand: `echo "Antigravity session cannot be directly resumed from terminal. Open its workspace folder at: ${cwd}"`,
+      openCommand: `code "${file}"`,
+      signals: { ...summary, firstPrompt, latest },
+    })];
+  });
+}
+
+function summarizeAntigravityTranscript(file) {
+  const summary = { toolCount: 0, userCount: 0, recentAssistant: [] };
+
+  const parts = file.split(/[\\/]/);
+  const brainIndex = parts.lastIndexOf("brain");
+  if (brainIndex >= 0 && parts[brainIndex + 1]) {
+    summary.sessionId = parts[brainIndex + 1];
+  }
+
+  const rows = readJsonl(file);
+  for (const item of rows) {
+    if (item.created_at) {
+      if (!summary.firstTimestamp) summary.firstTimestamp = item.created_at;
+      summary.lastTimestamp = item.created_at;
+    }
+
+    if (item.type === "USER_INPUT" && item.content) {
+      const text = extractAntigravityContent(item.content);
+      if (!summary.firstUser) {
+        const prompt = substantivePrompt(text);
+        if (prompt) {
+          summary.firstUser = prompt;
+          summary.firstUserRaw = text;
+        }
+      }
+      summary.userCount += 1;
+      summary.lastUser = text;
+
+      const wsMatch = item.content.match(/([a-zA-Z]:\\[^\r\n\t]+?)\s*->/i) || item.content.match(/(\/[^\r\n\t]+?)\s*->/i);
+      if (wsMatch && wsMatch[1]) {
+        summary.cwd = wsMatch[1].trim();
+      }
+    }
+
+    if (item.type === "PLANNER_RESPONSE" && item.content && item.source === "MODEL") {
+      pushRecent(summary, item.content);
+    }
+
+    if (item.tool_calls && Array.isArray(item.tool_calls)) {
+      summary.toolCount += item.tool_calls.length;
+
+      if (!summary.cwd) {
+        const cleanValue = (val) => {
+          if (typeof val !== "string") return "";
+          let s = val.trim();
+          if (s.startsWith('"') && s.endsWith('"')) {
+            s = s.slice(1, -1);
+          }
+          return s.replace(/\\\\/g, "\\").trim();
+        };
+
+        for (const call of item.tool_calls) {
+          const args = call.args || {};
+          const pathsToCheck = [args.AbsolutePath, args.TargetFile, args.SearchPath, args.DirectoryPath, args.Cwd];
+          for (const p of pathsToCheck) {
+            const cleaned = cleanValue(p);
+            if (cleaned && (cleaned.startsWith("/") || /^[a-zA-Z]:\\/i.test(cleaned))) {
+              const match = cleaned.match(/^([a-zA-Z]:\\Users\\[^\\]+\\Github\\[^\\]+)/i) || cleaned.match(/^(\/[^\/]+\/[^\/]+\/Github\/[^\/]+)/i);
+              if (match && match[1]) {
+                summary.cwd = match[1];
+                break;
+              }
+            }
+          }
+          if (summary.cwd) break;
+        }
+      }
+    }
+  }
+
+  return summary;
+}
+
+function extractAntigravityContent(content) {
+  if (typeof content !== "string") return "";
+  let cleanContent = content
+    .replace(/<user_information>[\s\S]*?<\/user_information>/gi, "")
+    .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
+    .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "")
+    .trim();
+
+  const reqMatch = cleanContent.match(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/i);
+  if (reqMatch) {
+    cleanContent = reqMatch[1].trim();
+  }
+
+  return cleanContent;
 }
 
 function repoKey(cwd) {
