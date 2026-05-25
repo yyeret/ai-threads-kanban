@@ -132,16 +132,19 @@ function scanCodex() {
     const match = path.basename(file).match(/([0-9a-f]{8}-[0-9a-f-]{27,})/i);
     return match?.[1] || "";
   });
-  return readJsonl(indexPath).flatMap((item) => {
-    const sessionId = String(item.id || "");
-    if (!sessionId) return [];
-    const transcript = rolloutFiles.get(sessionId);
+
+  function makeCodexCard(sessionId, threadName, updatedAt, transcript) {
     const summary = transcript ? summarizeCodexTranscript(transcript) : {};
-    const lastActivity = item.updated_at || summary.lastTimestamp || fileMtime(transcript);
+    const lastActivity = updatedAt || summary.lastTimestamp || fileMtime(transcript);
     if (new Date(lastActivity).getTime() < cutoff) return [];
     // thread_name may carry a "[Stage] " prefix stamped by apply-thread-names;
     // strip it so the prefix never compounds and never biases classification.
-    const title = clean(stripStagePrefix(item.thread_name) || summary.firstUser || `Codex ${shortId(sessionId)}`);
+    // Apply the same prompt-to-title extraction used for Claude so that
+    // long pasted documents get trimmed to their first meaningful sentence.
+    const rawTitle = stripStagePrefix(threadName)
+      || (summary.firstUser ? (claudeTitleFromPrompt(summary.firstUser) || summary.firstUser) : "")
+      || `Codex ${shortId(sessionId)}`;
+    const title = clean(rawTitle);
     const cwd = summary.cwd || "";
     const firstPrompt = clean(summary.firstUser || "");
     const latest = clean(summary.lastAssistant || summary.lastUser || "");
@@ -156,7 +159,7 @@ function scanCodex() {
       sessionId,
       title,
       cwd,
-      source: compact([indexPath, transcript]).join("; "),
+      source: compact([transcript]).join("; "),
       transcriptPath: transcript || "",
       firstPrompt,
       latest,
@@ -166,7 +169,26 @@ function scanCodex() {
       openCommand: transcript ? `code "${transcript}"` : "",
       signals: { ...summary, firstPrompt, latest },
     })];
+  }
+
+  // Sessions listed in the index (may have a curated thread_name).
+  const indexedIds = new Set();
+  const indexed = readJsonl(indexPath).flatMap((item) => {
+    const sessionId = String(item.id || "");
+    if (!sessionId) return [];
+    indexedIds.add(sessionId);
+    const transcript = rolloutFiles.get(sessionId);
+    return makeCodexCard(sessionId, item.thread_name || "", item.updated_at || "", transcript);
   });
+
+  // Rollout files that never made it into session_index.jsonl (Codex stopped
+  // updating the index for sessions started after ~April 2026).
+  const unindexed = [...rolloutFiles.entries()].flatMap(([sessionId, transcript]) => {
+    if (indexedIds.has(sessionId)) return [];
+    return makeCodexCard(sessionId, "", "", transcript);
+  });
+
+  return [...indexed, ...unindexed];
 }
 
 function scanGemini() {
