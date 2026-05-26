@@ -63,6 +63,14 @@ const existing = loadRegistry(registryPath);
 const seen = new Set();
 const registry = new Map(existing.map((r) => [r.thread_id, r]));
 
+// Auto-finish detection: Load "finish-thread" telemetry events
+const telemetryEvents = loadTelemetryEvents();
+const finishedSessions = new Set(
+  telemetryEvents
+    .filter((ev) => ev.skill_name === "finish-thread" && ev.session_id)
+    .map((ev) => ev.session_id)
+);
+
 for (const group of clusterCards(cards)) {
   const memberIds = unique(group.map((c) => c.thread_id)).sort();
   const threadId = memberIds[0]; // deterministic canonical id
@@ -79,11 +87,23 @@ for (const group of clusterCards(cards)) {
     ...group.map((c) => c.first_activity || c.last_activity),
   ]);
   const inferredStage = latest.stage;
-  const manualStage = prior?.manual_stage || null;
+  let manualStage = prior?.manual_stage || null;
+  let manualTracking = prior?.manual_tracking || null;
+  let manualStatus = prior?.manual_status || null;
+  let stageChangedAt = prior?.stage_changed_at || "";
+
+  // Auto-finish if any session in this thread has logged a "finish-thread" self-reported telemetry event!
+  const hasFinishSignal = sessions.some((s) => finishedSessions.has(s.session_id));
+  if (hasFinishSignal && manualStage !== "Done / Archive Candidates") {
+    manualStage = "Done / Archive Candidates";
+    manualTracking = "archive";
+    manualStatus = "done";
+    stageChangedAt = new Date().toISOString();
+  }
+
   const effectiveStage = manualStage || inferredStage;
   // A stage move counts as a touch — idle time is measured from the later of
   // real session activity and the last manual stage change.
-  const stageChangedAt = prior?.stage_changed_at || "";
   const lastTouch = maxDate([lastActivity, stageChangedAt]);
   const staleHours = lastTouch ? (now - Date.parse(lastTouch)) / 3.6e6 : null;
 
@@ -387,5 +407,49 @@ function expandHome(value) {
   if (value === "~") return home;
   if (value.startsWith("~/") || value.startsWith("~\\")) return path.join(home, value.slice(2));
   return value;
+}
+
+function resolveMemoryRoot() {
+  const env = process.env.AI_AGENT_MEMORY_ROOT || process.env.AGENT_MEMORY_ROOT;
+  if (env) return path.resolve(env);
+  const configPath = path.join(os.homedir(), ".config", "ai-skills", "agent-memory-root");
+  if (fs.existsSync(configPath)) {
+    const root = fs.readFileSync(configPath, "utf8").trim();
+    if (root) return path.resolve(root);
+  }
+  const regDir = resolveRegistryDir();
+  if (fs.existsSync(path.join(regDir, "skill-telemetry"))) {
+    return regDir;
+  }
+  const parent = path.dirname(path.dirname(regDir));
+  if (fs.existsSync(path.join(parent, "skill-telemetry"))) {
+    return parent;
+  }
+  return path.join(os.homedir(), ".agent-memory");
+}
+
+function loadTelemetryEvents() {
+  const memoryRoot = resolveMemoryRoot();
+  const file = path.join(memoryRoot, "skill-telemetry", "events.jsonl");
+  if (!fs.existsSync(file)) return [];
+  try {
+    const text = fs.readFileSync(file, "utf8");
+    const events = [];
+    const seen = new Set();
+    text.split(/\r?\n/).forEach((line) => {
+      if (!line.trim()) return;
+      try {
+        const ev = JSON.parse(line);
+        const key = ev.event_id || `${ev.session_id}-${ev.skill_name}-${ev.evidence_source}-${ev.sequence_index}-${ev.captured_at}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          events.push(ev);
+        }
+      } catch (err) {}
+    });
+    return events;
+  } catch (err) {
+    return [];
+  }
 }
 
