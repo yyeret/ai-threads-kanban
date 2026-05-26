@@ -34,6 +34,77 @@ const MUTED_STAGES = new Set(["Funnel / Triage", "On Hold", "Done / Archive Cand
 // request handlers never block on a Drive readFileSync that can stall
 // indefinitely in a launchd (non-GUI) session.
 let _registryCache = [];
+const indexPath = path.join(dir, "search-index.json");
+let _searchIndex = {};
+let _indexingInProgress = false;
+
+async function rebuildSearchIndex() {
+  if (_indexingInProgress) return;
+  _indexingInProgress = true;
+  if (devMode) console.log("[search] starting search index build...");
+  try {
+    let index = {};
+    if (fs.existsSync(indexPath)) {
+      try {
+        const indexText = await fs.promises.readFile(indexPath, "utf8");
+        index = JSON.parse(indexText);
+      } catch (err) {
+        if (devMode) console.error(`[search] failed to read index file: ${err.message}`);
+      }
+    }
+
+    let updated = false;
+    for (const thread of _registryCache) {
+      const threadId = thread.thread_id;
+      const s0 = (thread.sessions || [])[0];
+      const transcriptPath = s0?.transcript_path;
+
+      if (transcriptPath && fs.existsSync(transcriptPath)) {
+        try {
+          const stat = await fs.promises.stat(transcriptPath);
+          const mtime = stat.mtimeMs;
+          const size = stat.size;
+
+          const cached = index[threadId];
+          if (cached && cached.mtime === mtime && cached.size === size) {
+            continue;
+          }
+
+          if (devMode) console.log(`[search] indexing transcript: ${transcriptPath}`);
+          const messages = readTranscript(transcriptPath);
+          const transcriptText = messages.map(m => m.text).join(" ").toLowerCase();
+
+          index[threadId] = {
+            mtime,
+            size,
+            transcriptText,
+          };
+          updated = true;
+        } catch (err) {
+          if (devMode) console.error(`[search] failed to index ${transcriptPath}: ${err.message}`);
+        }
+      } else {
+        if (index[threadId]) {
+          delete index[threadId];
+          updated = true;
+        }
+      }
+    }
+
+    _searchIndex = index;
+    if (updated) {
+      await fs.promises.writeFile(indexPath, JSON.stringify(index, null, 2), "utf8");
+      if (devMode) console.log(`[search] index updated and saved.`);
+    } else {
+      if (devMode) console.log(`[search] index is already up to date.`);
+    }
+  } catch (err) {
+    if (devMode) console.error(`[search] indexing error: ${err.message}`);
+  } finally {
+    _indexingInProgress = false;
+  }
+}
+
 async function reloadRegistryCache() {
   try {
     const text = await fs.promises.readFile(registryPath, "utf8");
@@ -41,11 +112,14 @@ async function reloadRegistryCache() {
       .flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } })
       .sort((a, b) => Date.parse(b.last_activity || 0) - Date.parse(a.last_activity || 0));
     if (devMode) console.log(`[cache] loaded ${_registryCache.length} threads`);
+    
+    // Trigger indexing in the background asynchronously
+    rebuildSearchIndex();
   } catch (err) {
     if (devMode) console.error(`[cache] load failed: ${err.message}`);
   }
 }
-reloadRegistryCache(); // warm the cache on startup; non-blocking
+reloadRegistryCache(); // warm the cache and run indexer on startup; non-blocking
 
 const server = http.createServer((req, res) => {
   try {
@@ -57,7 +131,7 @@ const server = http.createServer((req, res) => {
     if (url.pathname === "/continue") return handleContinue(res, url.searchParams.get("id"), url.searchParams.get("step"));
     if (url.pathname === "/log") return handleLog(res, url.searchParams.get("id"));
     if (url.pathname === "/card") return handleCard(res, url.searchParams.get("id"));
-    if (url.pathname === "/refresh") return handleRefresh(res);
+    if (url.pathname === "/refresh") return handleRefresh(res, url.searchParams);
     if (url.pathname === "/set-stage") return handleSetStage(res, url.searchParams.get("id"), url.searchParams.get("stage"));
     res.writeHead(404).end("Not found");
   } catch (err) {
@@ -149,7 +223,7 @@ function handleSetStage(res, id, stage) {
   res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
 }
 
-function handleRefresh(res) {
+function handleRefresh(res, searchParams) {
   // Scan + reconcile only make sense when the process can reach the primary
   // registry (Drive). When running as a launchd agent the primary is
   // inaccessible; the local mirror is kept current by stop-hook refreshes.
@@ -161,7 +235,17 @@ function handleRefresh(res) {
     /* ignore — board still serves the last good registry */
   }
   reloadRegistryCache(); // async, non-blocking
-  res.writeHead(303, { Location: "/" }).end();
+  
+  const params = {};
+  if (searchParams) {
+    if (searchParams.get("area")) params.area = searchParams.get("area");
+    if (searchParams.get("harness")) params.harness = searchParams.get("harness");
+    if (searchParams.get("machine")) params.machine = searchParams.get("machine");
+    if (searchParams.get("q")) params.q = searchParams.get("q");
+  }
+  const from = searchParams?.get("from") || "/";
+  const redirectUrl = queryPath(from, params);
+  res.writeHead(303, { Location: redirectUrl }).end();
 }
 
 // --- terminal launch -------------------------------------------------------
@@ -207,82 +291,150 @@ function shellQuote(value) {
 
 function queryPath(basePath, params) {
   const query = Object.entries(params)
-    .filter(([, value]) => value)
+    .filter(([, value]) => value !== undefined && value !== "")
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
     .join("&");
   return query ? `${basePath}?${query}` : basePath;
 }
 
-function filterThreads(all, { areaFilter, harnessFilter, machineFilter }) {
-  return all.filter((t) => (
+function filterThreads(all, { areaFilter, harnessFilter, machineFilter, q }) {
+  let filtered = all.filter((t) => (
     (!areaFilter || t.intent_area === areaFilter)
     && (!harnessFilter || (t.harnesses || []).includes(harnessFilter))
     && (!machineFilter || (t.machines || []).includes(machineFilter))
   ));
+
+  if (q) {
+    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+    if (terms.length > 0) {
+      filtered = filtered.filter((t) => {
+        const transcriptText = _searchIndex[t.thread_id]?.transcriptText || "";
+        const fullText = [
+          t.title || "",
+          t.display_title || "",
+          t.outcome_intent || "",
+          t.notes || "",
+          t.where_it_stands || "",
+          t.next_step || "",
+          t.intent_area || "",
+          t.repo_key || "",
+          (t.harnesses || []).join(" "),
+          (t.machines || []).join(" "),
+          transcriptText
+        ].join(" ").toLowerCase();
+        return terms.every((term) => fullText.includes(term));
+      });
+    }
+  }
+  return filtered;
 }
 
-function filterSummary(threads, { areaFilter, harnessFilter, machineFilter }) {
+function filterSummary(threads, { areaFilter, harnessFilter, machineFilter, q }) {
   const parts = [];
   if (areaFilter) parts.push(`in ${esc(areaFilter)}`);
   if (harnessFilter) parts.push(`via ${esc(harnessFilter)}`);
   if (machineFilter) parts.push(`on ${esc(machineFilter)}`);
+  if (q) parts.push(`matching "${esc(q)}"`);
   return `${threads.length} threads${parts.length ? ` ${parts.join(" ")}` : ""}`;
 }
 
-function areaChipBar(all, areaFilter, harnessFilter, machineFilter, basePath) {
+function areaChipBar(all, areaFilter, harnessFilter, machineFilter, q, basePath) {
   const areas = [...new Set(all.map((t) => t.intent_area || "Other / Unsorted"))].sort();
-  const scoped = filterThreads(all, { harnessFilter, machineFilter });
-  const q = (a) => queryPath(basePath, { area: a || "", harness: harnessFilter || "", machine: machineFilter || "" });
+  const scoped = filterThreads(all, { harnessFilter, machineFilter, q });
+  const getQ = (a) => queryPath(basePath, { area: a || "", harness: harnessFilter || "", machine: machineFilter || "", q: q || "" });
   return [
-    `<a class="chip${areaFilter ? "" : " on"}" href="${q("")}">All areas (${scoped.length})</a>`,
+    `<a class="chip${areaFilter ? "" : " on"}" href="${getQ("")}">All areas (${scoped.length})</a>`,
     ...areas.map((a) => {
       const n = scoped.filter((t) => t.intent_area === a).length;
-      return `<a class="chip${areaFilter === a ? " on" : ""}" href="${q(a)}">${esc(a)} (${n})</a>`;
+      return `<a class="chip${areaFilter === a ? " on" : ""}" href="${getQ(a)}">${esc(a)} (${n})</a>`;
     }),
   ].join("");
 }
 
 // Harness filter: a thread matches a harness if any of its sessions used it.
-function harnessChipBar(all, harnessFilter, areaFilter, machineFilter, basePath) {
+function harnessChipBar(all, harnessFilter, areaFilter, machineFilter, q, basePath) {
   const harnesses = [...new Set(all.flatMap((t) => t.harnesses || []))].sort();
-  const scoped = filterThreads(all, { areaFilter, machineFilter });
-  const q = (h) => queryPath(basePath, { area: areaFilter || "", harness: h || "", machine: machineFilter || "" });
+  const scoped = filterThreads(all, { areaFilter, machineFilter, q });
+  const getQ = (h) => queryPath(basePath, { area: areaFilter || "", harness: h || "", machine: machineFilter || "", q: q || "" });
   return [
-    `<a class="chip${harnessFilter ? "" : " on"}" href="${q("")}">All harnesses (${scoped.length})</a>`,
+    `<a class="chip${harnessFilter ? "" : " on"}" href="${getQ("")}">All harnesses (${scoped.length})</a>`,
     ...harnesses.map((h) => {
       const n = scoped.filter((t) => (t.harnesses || []).includes(h)).length;
-      return `<a class="chip${harnessFilter === h ? " on" : ""}" href="${q(h)}">${esc(h)} (${n})</a>`;
+      return `<a class="chip${harnessFilter === h ? " on" : ""}" href="${getQ(h)}">${esc(h)} (${n})</a>`;
     }),
   ].join("");
 }
 
-function machineChipBar(all, machineFilter, areaFilter, harnessFilter, basePath) {
+function machineChipBar(all, machineFilter, areaFilter, harnessFilter, q, basePath) {
   const machines = [...new Set(all.flatMap((t) => t.machines || []))].sort();
-  const scoped = filterThreads(all, { areaFilter, harnessFilter });
-  const q = (m) => queryPath(basePath, { area: areaFilter || "", harness: harnessFilter || "", machine: m || "" });
+  const scoped = filterThreads(all, { areaFilter, harnessFilter, q });
+  const getQ = (m) => queryPath(basePath, { area: areaFilter || "", harness: harnessFilter || "", machine: m || "", q: q || "" });
   return [
-    `<a class="chip${machineFilter ? "" : " on"}" href="${q("")}">All machines (${scoped.length})</a>`,
+    `<a class="chip${machineFilter ? "" : " on"}" href="${getQ("")}">All machines (${scoped.length})</a>`,
     ...machines.map((m) => {
       const n = scoped.filter((t) => (t.machines || []).includes(m)).length;
-      return `<a class="chip${machineFilter === m ? " on" : ""}" href="${q(m)}">${esc(m)} (${n})</a>`;
+      return `<a class="chip${machineFilter === m ? " on" : ""}" href="${getQ(m)}">${esc(m)} (${n})</a>`;
     }),
   ].join("");
 }
 
-function nav(active) {
-  const link = (href, label) => `<a class="${active === href ? "navon" : ""}" href="${href}">${label}</a>`;
+function nav(active, searchParams) {
+  const params = {};
+  if (searchParams) {
+    if (searchParams.get("area")) params.area = searchParams.get("area");
+    if (searchParams.get("harness")) params.harness = searchParams.get("harness");
+    if (searchParams.get("machine")) params.machine = searchParams.get("machine");
+    if (searchParams.get("q")) params.q = searchParams.get("q");
+  }
+  params.from = active;
+  
+  const link = (href, label) => {
+    const targetHref = queryPath(href, params);
+    return `<a class="${active === href ? "navon" : ""}" href="${targetHref}">${label}</a>`;
+  };
+  
+  const refreshHref = queryPath("/refresh", params);
   return `<div class="nav">${link("/", "List view")} ${link("/kanban", "Kanban view")}
     ${link("/telemetry", "Telemetry Insights")}
     ${link("/kanban-ipsum", "Shareable")} ·
-    <a href="/refresh">refresh now</a></div>`;
+    <a href="${refreshHref}">refresh now</a></div>`;
+}
+
+function renderSearchForm(q, areaFilter, harnessFilter, machineFilter) {
+  return `
+    <div class="search-container">
+      <form action="" method="GET" class="search-form" id="search-form">
+        ${areaFilter ? `<input type="hidden" name="area" value="${esc(areaFilter)}">` : ""}
+        ${harnessFilter ? `<input type="hidden" name="harness" value="${esc(harnessFilter)}">` : ""}
+        ${machineFilter ? `<input type="hidden" name="machine" value="${esc(machineFilter)}">` : ""}
+        <input type="search" name="q" class="search-input" placeholder="Search threads & transcripts..." value="${esc(q)}" autocomplete="off" id="search-input">
+        ${q ? `<button type="button" class="clear-btn" id="clear-search-btn" title="Clear search">&times;</button>` : ""}
+        <button type="submit" class="search-btn">Search</button>
+      </form>
+    </div>
+    <script>
+      (function() {
+        var clearBtn = document.getElementById("clear-search-btn");
+        var searchInput = document.getElementById("search-input");
+        var searchForm = document.getElementById("search-form");
+        if (clearBtn && searchInput && searchForm) {
+          clearBtn.addEventListener("click", function() {
+            searchInput.value = "";
+            searchForm.submit();
+          });
+        }
+      })();
+    </script>
+  `;
 }
 
 function renderBoard(searchParams) {
   const areaFilter = searchParams.get("area") || "";
   const harnessFilter = searchParams.get("harness") || "";
   const machineFilter = searchParams.get("machine") || "";
+  const q = searchParams.get("q") || "";
   const all = visibleThreads(loadRegistry());
-  const threads = filterThreads(all, { areaFilter, harnessFilter, machineFilter });
+  const threads = filterThreads(all, { areaFilter, harnessFilter, machineFilter, q });
 
   // Reverse flow order — Done at the top, Funnel at the bottom — so the eye
   // lands on finishing before starting. Done starts collapsed.
@@ -301,12 +453,13 @@ function renderBoard(searchParams) {
   return page("AI Thread Board", `
     <header>
       <h1>AI Thread Board</h1>
-      ${nav("/")}
-      <div class="meta">${filterSummary(threads, { areaFilter, harnessFilter, machineFilter })} · auto-refreshes every 60s</div>
+      ${nav("/", searchParams)}
+      <div class="meta">${filterSummary(threads, { areaFilter, harnessFilter, machineFilter, q })} · auto-refreshes every 60s</div>
     </header>
-    <div class="chips">${areaChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), areaFilter, harnessFilter, machineFilter, "/")}</div>
-    <div class="chips chips-harness">${harnessChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), harnessFilter, areaFilter, machineFilter, "/")}</div>
-    <div class="chips">${machineChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), machineFilter, areaFilter, harnessFilter, "/")}</div>
+    ${renderSearchForm(q, areaFilter, harnessFilter, machineFilter)}
+    <div class="chips">${areaChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), areaFilter, harnessFilter, machineFilter, q, "/")}</div>
+    <div class="chips chips-harness">${harnessChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), harnessFilter, areaFilter, machineFilter, q, "/")}</div>
+    <div class="chips">${machineChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), machineFilter, areaFilter, harnessFilter, q, "/")}</div>
     ${sections || "<p>No threads.</p>"}
   `);
 }
@@ -315,8 +468,9 @@ function renderKanban(searchParams, ipsum) {
   const areaFilter = ipsum ? "" : (searchParams.get("area") || "");
   const harnessFilter = ipsum ? "" : (searchParams.get("harness") || "");
   const machineFilter = ipsum ? "" : (searchParams.get("machine") || "");
+  const q = ipsum ? "" : (searchParams.get("q") || "");
   const all = visibleThreads(loadRegistry());
-  const threads = ipsum ? all : filterThreads(all, { areaFilter, harnessFilter, machineFilter });
+  const threads = ipsum ? all : filterThreads(all, { areaFilter, harnessFilter, machineFilter, q });
 
   const lanes = STAGE_ORDER.map((stage) => {
     const items = threads
@@ -350,7 +504,7 @@ function renderKanban(searchParams, ipsum) {
       return `
       <div class="mini${t.aging ? " mini-aging" : ""}${t.blocked ? " mini-blocked" : ""}${ipsum ? "" : " mini-open"}"${drag}
          style="border-left-color:${areaColor(t.intent_area)}" title="${tip}">
-        <span class="mini-title">${esc(truncate(title, 90))}</span>
+         <span class="mini-title">${esc(truncate(title, 90))}</span>
         <span class="mini-foot">
           <span class="mini-meta">${blk}${agePill(t)} <span class="mini-dim">${(t.harnesses || []).join("/")}${!ipsum && machineLabel(t) ? ` · ${esc(machineLabel(t))}` : ""}</span></span>
           ${acts}
@@ -367,7 +521,7 @@ function renderKanban(searchParams, ipsum) {
     return page("Thread Board — Shareable", `
       <header>
         <h1>Thread Board <span class="dim">(shareable view)</span></h1>
-        ${nav("/kanban-ipsum")}
+        ${nav("/kanban-ipsum", searchParams)}
         <div class="meta">${threads.length} threads · card titles obfuscated — safe to screenshot</div>
       </header>
       <div class="board">${lanes}</div>
@@ -376,13 +530,14 @@ function renderKanban(searchParams, ipsum) {
   return page("AI Thread Board — Kanban", `
     <header>
       <h1>AI Thread Board — Kanban</h1>
-      ${nav("/kanban")}
-      <div class="meta">${filterSummary(threads, { areaFilter, harnessFilter, machineFilter })} ·
+      ${nav("/kanban", searchParams)}
+      <div class="meta">${filterSummary(threads, { areaFilter, harnessFilter, machineFilter, q })} ·
         drag a card to another lane to change its stage</div>
     </header>
-    <div class="chips">${areaChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), areaFilter, harnessFilter, machineFilter, "/kanban")}</div>
-    <div class="chips chips-harness">${harnessChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), harnessFilter, areaFilter, machineFilter, "/kanban")}</div>
-    <div class="chips">${machineChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), machineFilter, areaFilter, harnessFilter, "/kanban")}</div>
+    ${renderSearchForm(q, areaFilter, harnessFilter, machineFilter)}
+    <div class="chips">${areaChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), areaFilter, harnessFilter, machineFilter, q, "/kanban")}</div>
+    <div class="chips chips-harness">${harnessChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), harnessFilter, areaFilter, machineFilter, q, "/kanban")}</div>
+    <div class="chips">${machineChipBar(all.filter(t => t.stage !== "Done / Archive Candidates"), machineFilter, areaFilter, harnessFilter, q, "/kanban")}</div>
     <div class="board" id="board">${lanes}</div>
     <div id="modal" class="modal-overlay" hidden>
       <div class="modal-box">
@@ -836,6 +991,20 @@ function page(title, body) {
   .modal-close { position: absolute; top: 4px; right: 12px; border: none; background: transparent; font-size: 24px; line-height: 1; cursor: pointer; color: #667; }
   .modal-box .card { margin: 0; }
   .chips { padding: 4px 20px 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .search-container { margin: 8px 20px 12px; display: flex; gap: 8px; max-width: 500px; }
+  .search-form { display: flex; width: 100%; gap: 6px; align-items: center; background: #fff; border: 1px solid #c8cdd8; border-radius: 20px; padding: 2px 4px 2px 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+  .search-input { flex: 1; border: none; background: transparent; color: #1a1a2e; font-size: 13px; padding: 6px 0; outline: none; }
+  .search-input::placeholder { color: #889; }
+  .search-btn { padding: 5px 14px; border-radius: 16px; border: none; background: #2563eb; color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; transition: background 0.15s, transform 0.1s; }
+  .search-btn:hover { background: #1d4ed8; }
+  .search-btn:active { transform: scale(0.97); }
+  .clear-btn { background: transparent; border: none; color: #667; font-size: 18px; line-height: 1; cursor: pointer; padding: 0 4px; display: flex; align-items: center; justify-content: center; height: 22px; width: 22px; border-radius: 50%; }
+  .clear-btn:hover { background: #f1f3f9; color: #1a1a2e; }
+  @media (prefers-color-scheme: dark) {
+    .search-form { background: #1e293b; border-color: #334155; }
+    .search-input { color: #f8fafc; }
+    .clear-btn:hover { background: #334155; color: #f8fafc; }
+  }
   .chips-harness { padding-top: 0; }
   .chips-harness .chip { background: #f1f5f9; font-size: 11px; padding: 2px 9px; }
   .chips-harness .chip.on { background: #0f172a; color: #fff; }
@@ -1107,7 +1276,7 @@ function renderTelemetry(searchParams) {
   const body = `
     <header style="padding:18px 24px 8px;">
       <h1>Skill Telemetry Insights</h1>
-      ${nav("/telemetry")}
+      ${nav("/telemetry", searchParams)}
       <div class="meta">Analyses of local event stream · unified cross-machine data</div>
     </header>
 
