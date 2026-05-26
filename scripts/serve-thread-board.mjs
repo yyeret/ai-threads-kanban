@@ -9,7 +9,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFileSync, execSync } from "node:child_process";
 import { resolveRegistryDir } from "./lib/paths.mjs";
 
 const home = os.homedir();
@@ -224,6 +224,36 @@ function handleSetStage(res, id, stage) {
 }
 
 function handleRefresh(res, searchParams) {
+  let gitUpdated = false;
+  const repoRoot = path.join(scriptDir, "..");
+  
+  // Check Git self-updates
+  try {
+    const isGit = fs.existsSync(path.join(repoRoot, ".git"));
+    if (isGit) {
+      const beforeHead = execSync("git rev-parse HEAD", { cwd: repoRoot, encoding: "utf8" }).trim();
+      execSync("git pull", { cwd: repoRoot, stdio: "ignore" });
+      const afterHead = execSync("git rev-parse HEAD", { cwd: repoRoot, encoding: "utf8" }).trim();
+      if (beforeHead !== afterHead) {
+        gitUpdated = true;
+        if (devMode) console.log(`[git] updated from ${beforeHead} to ${afterHead}`);
+        // Run npm install if package.json changed
+        try {
+          const changedFiles = execSync(`git diff --name-only ${beforeHead} ${afterHead}`, { cwd: repoRoot, encoding: "utf8" })
+            .split(/\r?\n/);
+          if (changedFiles.includes("package.json")) {
+            if (devMode) console.log("[git] package.json changed, running npm install...");
+            execSync("npm install", { cwd: repoRoot, stdio: "ignore" });
+          }
+        } catch (err) {
+          if (devMode) console.error(`[git] npm install failed: ${err.message}`);
+        }
+      }
+    }
+  } catch (err) {
+    if (devMode) console.error(`[git] update failed: ${err.message}`);
+  }
+
   // Scan + reconcile only make sense when the process can reach the primary
   // registry (Drive). When running as a launchd agent the primary is
   // inaccessible; the local mirror is kept current by stop-hook refreshes.
@@ -246,6 +276,14 @@ function handleRefresh(res, searchParams) {
   const from = searchParams?.get("from") || "/";
   const redirectUrl = queryPath(from, params);
   res.writeHead(303, { Location: redirectUrl }).end();
+
+  // Gracefully exit to trigger process manager restart if git was updated
+  if (gitUpdated) {
+    if (devMode) console.log("[git] exiting to restart server...");
+    setTimeout(() => {
+      process.exit(0);
+    }, 500);
+  }
 }
 
 // --- terminal launch -------------------------------------------------------
