@@ -5,6 +5,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { resolveRegistryDir } from "./lib/paths.mjs";
+import { fileURLToPath } from "node:url";
 
 const args = parseArgs(process.argv.slice(2));
 const home = os.homedir();
@@ -37,6 +38,8 @@ writeJsonl(path.join(outputDir, `threads.${machineSlug}.jsonl`), cards);
 fs.writeFileSync(path.join(outputDir, `current-board.${machineSlug}.md`), renderBoard(cards), "utf8");
 writeJsonl(path.join(outputDir, "threads.jsonl"), cards);
 fs.writeFileSync(path.join(outputDir, "current-board.md"), renderBoard(cards), "utf8");
+
+logScannerVersion(outputDir, machine, path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
 
 console.log(`Wrote ${cards.length} cards for ${machine} to ${outputDir}`);
 
@@ -932,4 +935,43 @@ function safeFileName(value) {
     .replace(/[^a-z0-9._-]+/gi, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 80) || "unknown";
+}
+
+function logScannerVersion(outputDir, machine, repoRoot) {
+  try {
+    const pkgPath = path.join(repoRoot, "package.json");
+    if (!fs.existsSync(pkgPath)) return;
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    const version = pkg.version;
+
+    const machinesPath = path.join(outputDir, "machines.json");
+    let data = {};
+    if (fs.existsSync(machinesPath)) {
+      try {
+        let text = fs.readFileSync(machinesPath, "utf8");
+        if (text.startsWith("\ufeff")) {
+          text = text.slice(1);
+        }
+        data = JSON.parse(text);
+      } catch (err) {
+        console.error(`[version-debug] JSON parse error: ${err.message}`);
+      }
+    }
+
+
+    if (!data[machine]) {
+      data[machine] = { version, last_deployed: "", harnesses: {} };
+    } else {
+      data[machine].version = version;
+    }
+    
+    data[machine].scanner = {
+      version,
+      last_run: new Date().toISOString()
+    };
+    
+    fs.writeFileSync(machinesPath, JSON.stringify(data, null, 2), "utf8");
+  } catch (err) {
+    console.error(`[version] Failed to log scanner version: ${err.message}`);
+  }
 }

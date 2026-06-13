@@ -27,7 +27,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..").Path
-$Home = $env:USERPROFILE
+# $Home is a built-in read-only variable in PowerShell, no need to assign it.
+
 
 function Resolve-Node {
   $candidates = @(
@@ -41,7 +42,10 @@ function Resolve-Node {
 
 # 1. Registry root.
 if (-not $RegistryRoot) {
-  if ($env:AI_AGENT_MEMORY_ROOT) {
+  $ExistingConfig = Join-Path $Home ".config\ai-threads-kanban\registry-root"
+  if (Test-Path $ExistingConfig) {
+    $RegistryRoot = (Get-Content -Raw $ExistingConfig).Trim()
+  } elseif ($env:AI_AGENT_MEMORY_ROOT) {
     $RegistryRoot = Join-Path $env:AI_AGENT_MEMORY_ROOT "projects\agent-threads"
   } else {
     $RegistryRoot = Join-Path $env:LOCALAPPDATA "ai-threads-kanban"
@@ -52,6 +56,70 @@ $ConfigDir = Join-Path $Home ".config\ai-threads-kanban"
 $null = New-Item -ItemType Directory -Force -Path $ConfigDir
 Set-Content -Path (Join-Path $ConfigDir "registry-root") -Value $RegistryRoot -Encoding utf8
 Write-Host "Registry root: $RegistryRoot"
+
+# 1b. OS Versioning and Deployment Tracking
+$PkgJson = Get-Content -Raw (Join-Path $RepoRoot "package.json") | ConvertFrom-Json
+$Version = $PkgJson.version
+Write-Host "Yuval-OS Version: $Version"
+
+$VersionObj = @{
+  version = $Version
+  installed_at = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+  repo_path = $RepoRoot
+}
+$VersionJson = $VersionObj | ConvertTo-Json
+Set-Content -Path (Join-Path $ConfigDir "version.json") -Value $VersionJson -Encoding utf8
+
+$ActiveHarnesses = @()
+$HarnessStatus = @{}
+$HarnessesToCheck = @(
+  @{ Key = "Claude"; Dir = Join-Path $Home ".claude"; Name = "Claude Code" },
+  @{ Key = "Codex";  Dir = Join-Path $Home ".codex";  Name = "Codex" },
+  @{ Key = "Gemini"; Dir = Join-Path $Home ".gemini"; Name = "Gemini" }
+)
+foreach ($h in $HarnessesToCheck) {
+  $Installed = Test-Path $h.Dir
+  $HarnessStatus[$h.Key] = @{ installed = $Installed; version = $Version }
+  if ($Installed) {
+    $ActiveHarnesses += $h.Key
+    Set-Content -Path (Join-Path $h.Dir "ai-threads-version.json") -Value $VersionJson -Encoding utf8
+    Write-Host "  $($h.Name) detected, writing version config."
+  }
+}
+$AntigravityDir = Join-Path $Home ".gemini\antigravity"
+$AntiInstalled = Test-Path $AntigravityDir
+$HarnessStatus["Antigravity"] = @{ installed = $AntiInstalled; version = $Version }
+if ($AntiInstalled) {
+  $ActiveHarnesses += "Antigravity"
+  Write-Host "  Antigravity detected."
+}
+
+$MachineName = (hostname).Trim()
+
+$DeployEvent = @{
+  machine = $MachineName
+  version = $Version
+  timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+  harnesses = $ActiveHarnesses
+  status = "installed"
+}
+$DeployEventJson = $DeployEvent | ConvertTo-Json -Compress
+Add-Content -Path (Join-Path $RegistryRoot "deployments.jsonl") -Value $DeployEventJson -Encoding utf8
+
+$MachinesPath = Join-Path $RegistryRoot "machines.json"
+$MachinesMap = @{}
+if (Test-Path $MachinesPath) {
+  try {
+    $MachinesMap = Get-Content -Raw $MachinesPath | ConvertFrom-Json -AsHashtable
+  } catch {}
+}
+$MachinesMap[$MachineName] = @{
+  version = $Version
+  last_deployed = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+  harnesses = $HarnessStatus
+}
+ConvertTo-Json -InputObject $MachinesMap -Depth 5 | Set-Content -Path $MachinesPath -Encoding utf8
+Write-Host "Logged installation to deployments.jsonl and machines.json"
 
 # 2. Slash commands.
 function Install-Skill {

@@ -140,6 +140,8 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(port, "127.0.0.1", () => {
+  const repoRoot = path.join(scriptDir, "..");
+  logServerVersion(dir, os.hostname(), repoRoot);
   console.log(`AI thread board: http://127.0.0.1:${port}`);
 });
 
@@ -977,6 +979,40 @@ function sendHtml(res, html) {
 }
 
 function page(title, body) {
+  const machinesPath = path.join(dir, "machines.json");
+  let statusHtml = "";
+  if (fs.existsSync(machinesPath)) {
+    try {
+      let text = fs.readFileSync(machinesPath, "utf8");
+      if (text.startsWith("\ufeff")) {
+        text = text.slice(1);
+      }
+      const data = JSON.parse(text);
+      const items = [];
+      for (const [mName, mInfo] of Object.entries(data)) {
+        const hList = [];
+        for (const [hName, hInfo] of Object.entries(mInfo.harnesses || {})) {
+          if (hInfo.installed) {
+            hList.push(`${hName} (v${hInfo.version || "0.1.0"})`);
+          }
+        }
+        
+        let runnerInfo = "";
+        if (mInfo.server) {
+          runnerInfo += ` · server v${mInfo.server.version || "0.1.0"}`;
+        }
+        if (mInfo.scanner) {
+          runnerInfo += ` · scanner v${mInfo.scanner.version || "0.1.0"}`;
+        }
+
+        items.push(`<div class="machine-status"><strong>${esc(mName)}</strong>: v${esc(mInfo.version || "0.1.0")}${runnerInfo} [harnesses: ${esc(hList.join(", ") || "none")}]</div>`);
+      }
+      if (items.length) {
+        statusHtml = `<div class="system-status-bar"><div class="system-status-title">Yuval-OS System Status</div>${items.join("")}</div>`;
+      }
+    } catch (err) {}
+  }
+
   return `<!doctype html><html><head><meta charset="utf-8">
 <title>${esc(title)}</title>
 <meta http-equiv="refresh" content="60">
@@ -1077,7 +1113,14 @@ function page(title, body) {
   .msg.assistant { border-left: 3px solid #16a34a; }
   .role { font-size: 11px; text-transform: uppercase; color: #889; }
   .text { white-space: pre-wrap; word-break: break-word; }
-</style></head><body>${body}</body></html>`;
+  .system-status-bar { background: #e2e8f0; border-top: 1px solid #cbd5e1; padding: 12px 24px; font-size: 11px; color: #475569; margin-top: 40px; }
+  .system-status-title { font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; font-size: 10px; color: #334155; }
+  .machine-status { margin: 2px 0; }
+  @media (prefers-color-scheme: dark) {
+    .system-status-bar { background: #1e293b; border-color: #334155; color: #94a3b8; }
+    .system-status-title { color: #cbd5e1; }
+  }
+</style></head><body>${body}${statusHtml}</body></html>`;
 }
 
 function parseArgs(argv) {
@@ -1384,5 +1427,41 @@ function renderTelemetry(searchParams) {
     </div>
   `;
   return page("Skill Telemetry Insights", body);
+}
+
+function logServerVersion(outputDir, machine, repoRoot) {
+  try {
+    const pkgPath = path.join(repoRoot, "package.json");
+    if (!fs.existsSync(pkgPath)) return;
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    const version = pkg.version;
+
+    const machinesPath = path.join(outputDir, "machines.json");
+    let data = {};
+    if (fs.existsSync(machinesPath)) {
+      try {
+        let text = fs.readFileSync(machinesPath, "utf8");
+        if (text.startsWith("\ufeff")) {
+          text = text.slice(1);
+        }
+        data = JSON.parse(text);
+      } catch (err) {}
+    }
+
+    if (!data[machine]) {
+      data[machine] = { version, last_deployed: "", harnesses: {} };
+    } else {
+      data[machine].version = version;
+    }
+    
+    data[machine].server = {
+      version,
+      last_run: new Date().toISOString()
+    };
+    
+    fs.writeFileSync(machinesPath, JSON.stringify(data, null, 2), "utf8");
+  } catch (err) {
+    console.error(`[version] Failed to log server version: ${err.message}`);
+  }
 }
 

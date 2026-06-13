@@ -39,7 +39,9 @@ done
 # 1. Registry root. If the user already runs an agent-memory vault we honor
 #    AI_AGENT_MEMORY_ROOT; otherwise default to ~/.local/share/ai-threads-kanban.
 if [[ -z "$REGISTRY_ROOT" ]]; then
-  if [[ -n "${AI_AGENT_MEMORY_ROOT:-}" ]]; then
+  if [[ -f "$HOME/.config/ai-threads-kanban/registry-root" ]]; then
+    REGISTRY_ROOT="$(cat "$HOME/.config/ai-threads-kanban/registry-root" | tr -d '\r\n' | xargs)"
+  elif [[ -n "${AI_AGENT_MEMORY_ROOT:-}" ]]; then
     REGISTRY_ROOT="$AI_AGENT_MEMORY_ROOT/projects/agent-threads"
   else
     REGISTRY_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/ai-threads-kanban"
@@ -48,6 +50,119 @@ fi
 mkdir -p "$REGISTRY_ROOT" "$HOME/.config/ai-threads-kanban"
 echo "$REGISTRY_ROOT" > "$HOME/.config/ai-threads-kanban/registry-root"
 echo "Registry root: $REGISTRY_ROOT"
+
+# 1b. OS Versioning and Deployment Tracking
+NODE_BIN="$(command -v node 2>/dev/null || true)"
+[[ -z "$NODE_BIN" ]] && for c in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
+  [[ -x "$c" ]] && NODE_BIN="$c" && break
+done
+
+if [[ -n "$NODE_BIN" ]]; then
+  VERSION="$("$NODE_BIN" -e "console.log(require('$REPO_ROOT/package.json').version)" 2>/dev/null || grep '"version"' "$REPO_ROOT/package.json" | head -n 1 | cut -d'"' -f4)"
+else
+  VERSION="$(grep '"version"' "$REPO_ROOT/package.json" | head -n 1 | cut -d'"' -f4)"
+fi
+
+echo "Yuval-OS Version: $VERSION"
+
+TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")"
+cat <<EOF > "$HOME/.config/ai-threads-kanban/version.json"
+{
+  "version": "$VERSION",
+  "installed_at": "$TIMESTAMP",
+  "repo_path": "$REPO_ROOT"
+}
+EOF
+
+ACTIVE_HARNESSES=()
+CLAUDE_INSTALLED="false"
+CODEX_INSTALLED="false"
+GEMINI_INSTALLED="false"
+ANTIGRAVITY_INSTALLED="false"
+
+if [[ -d "$HOME/.claude" ]]; then
+  CLAUDE_INSTALLED="true"
+  ACTIVE_HARNESSES+=("Claude")
+  cp "$HOME/.config/ai-threads-kanban/version.json" "$HOME/.claude/ai-threads-version.json"
+  echo "  Claude Code detected, writing version config."
+fi
+
+if [[ -d "$HOME/.codex" ]]; then
+  CODEX_INSTALLED="true"
+  ACTIVE_HARNESSES+=("Codex")
+  cp "$HOME/.config/ai-threads-kanban/version.json" "$HOME/.codex/ai-threads-version.json"
+  echo "  Codex detected, writing version config."
+fi
+
+if [[ -d "$HOME/.gemini" ]]; then
+  GEMINI_INSTALLED="true"
+  ACTIVE_HARNESSES+=("Gemini")
+  cp "$HOME/.config/ai-threads-kanban/version.json" "$HOME/.gemini/ai-threads-version.json"
+  echo "  Gemini detected, writing version config."
+fi
+
+if [[ -d "$HOME/.gemini/antigravity" ]]; then
+  ANTIGRAVITY_INSTALLED="true"
+  ACTIVE_HARNESSES+=("Antigravity")
+  echo "  Antigravity detected."
+fi
+
+HARNESSES_JSON="["
+first=1
+for h in "${ACTIVE_HARNESSES[@]:-}"; do
+  if [[ $first -eq 1 ]]; then
+    HARNESSES_JSON+="\"$h\""
+    first=0
+  else
+    HARNESSES_JSON+=", \"$h\""
+  fi
+done
+HARNESSES_JSON+="]"
+
+HOST_NAME="$(hostname)"
+cat <<EOF >> "$REGISTRY_ROOT/deployments.jsonl"
+{"machine":"$HOST_NAME","version":"$VERSION","timestamp":"$TIMESTAMP","harnesses":$HARNESSES_JSON,"status":"installed"}
+EOF
+
+MACHINES_JSON_PATH="$REGISTRY_ROOT/machines.json"
+if [[ -n "$NODE_BIN" ]]; then
+  "$NODE_BIN" -e "
+    const fs = require('fs');
+    const p = '$MACHINES_JSON_PATH';
+    let data = {};
+    if (fs.existsSync(p)) {
+      try { data = JSON.parse(fs.readFileSync(p, 'utf8')); } catch(e) {}
+    }
+    data['$HOST_NAME'] = {
+      version: '$VERSION',
+      last_deployed: '$TIMESTAMP',
+      harnesses: {
+        Claude: { installed: $CLAUDE_INSTALLED, version: '$VERSION' },
+        Codex: { installed: $CODEX_INSTALLED, version: '$VERSION' },
+        Gemini: { installed: $GEMINI_INSTALLED, version: '$VERSION' },
+        Antigravity: { installed: $ANTIGRAVITY_INSTALLED, version: '$VERSION' }
+      }
+    };
+    fs.writeFileSync(p, JSON.stringify(data, null, 2), 'utf8');
+  " 2>/dev/null || true
+else
+  cat <<EOF > "$MACHINES_JSON_PATH"
+{
+  "$HOST_NAME": {
+    "version": "$VERSION",
+    "last_deployed": "$TIMESTAMP",
+    "harnesses": {
+      "Claude": { "installed": $CLAUDE_INSTALLED, "version": "$VERSION" },
+      "Codex": { "installed": $CODEX_INSTALLED, "version": "$VERSION" },
+      "Gemini": { "installed": $GEMINI_INSTALLED, "version": "$VERSION" },
+      "Antigravity": { "installed": $ANTIGRAVITY_INSTALLED, "version": "$VERSION" }
+    }
+  }
+}
+EOF
+fi
+
+echo "Logged installation to deployments.jsonl and machines.json"
 
 # 2. Slash commands — render {{REPO_ROOT}} and copy into each harness.
 render() {
