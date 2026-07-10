@@ -30,3 +30,8 @@ This document records the key architectural, design, and styling decisions made 
 - **Decision:** Maintain a registry of version information per machine/harness in the shared `machines.json`.
 - **Rationale:** Keeps track of the deployed "Yuval-OS" setup on all machines, helping identify out-of-date installations.
 - **Implementation:** The installer, server startup, and scanner execution dynamically report their versions.
+
+### 6. Goal Network Above Thread Registry
+- **Decision:** The goal-driven development POC should derive a file-backed goal network from the existing thread registry rather than replacing the registry or introducing a database first.
+- **Rationale:** The registry already contains thread IDs, stages, outcome intents, notes, next steps, and transcript references. A derived goal layer can be inspected, corrected, and used by agents before committing to UI or persistence complexity.
+- **Implementation:** First prove the concept with static generated Markdown/JSON artifacts; defer a `/goals` board view until the artifact changes prioritization or resume behavior.

@@ -4,6 +4,7 @@ This file tracks the active and completed threads associated with the developmen
 
 | Thread ID | Slug | Description | Stage | Status |
 |---|---|---|---|---|
+| `goalnet202607` | [`goal-network-poc`](threads/goal-network-poc/thread-state.md) | Extract an outcome-mapped goal network from AI thread history as a POC for goal-driven development | Specify | In Progress |
 | `0b09f33a67e8` | [`layered-memory-setup`](threads/layered-memory-setup/thread-state.md) | Implement workspace-local thread state overrides and Yuval-OS deployment tracking | Plan | In Progress |
 
 ---
