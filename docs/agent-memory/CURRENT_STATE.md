@@ -12,8 +12,8 @@ The active slice is the **Goal Network POC**:
 The previous **Layered Project Memory and OS Versioning System** (`v0.2.0`) remains relevant but is no longer the active product direction for this session.
 
 ## Open Loops
-- **Goal extraction contract:** Define the generated goal-network schema and where it lives.
-- **Static artifact first:** Generate and review goal-network Markdown/JSON before adding UI.
+- **Artifact review:** Inspect the generated goal-network Markdown/JSON for 5-10 representative goals and mark incorrect merges/splits/names.
+- **Correction path:** Decide whether to add a goal override map for merge/split/rename decisions before building a `/goals` UI.
 - **Reconciler override:** Verify `reconcile-threads.mjs` correctly scans the `/docs/agent-memory/threads/` folders and updates the registry.
 - **Harness scanning:** Ensure the installer detects and updates version config files for all active harnesses on the host machine.
 - **Dynamic logging:** Verify the server and scanner update `machines.json` dynamically when they run.
@@ -22,3 +22,4 @@ The previous **Layered Project Memory and OS Versioning System** (`v0.2.0`) rema
 - Bumped version in `package.json` to `0.2.0`.
 - Initialized `AGENTS.md` and `CLAUDE.md` in the project root.
 - Added `plans/2026-07-10-goal-network-poc.md` and `docs/agent-memory/threads/goal-network-poc/thread-state.md` for the new goal-network POC direction.
+- Added deterministic goal-network extraction plus a reusable extraction contract as the Compound Engineering artifact.

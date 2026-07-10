@@ -21,6 +21,7 @@ Zero dependencies — uses `node:test` from Node 18+ stdlib.
 | File | Locks in |
 |---|---|
 | `reconcile-threads.test.mjs` | `manual_status` / `manual_tracking` / `manual_area` survive rescan; legacy-stage healing. |
+| `extract-goal-network.test.mjs` | Goal-network artifacts are generated from registry records; done/archive filtering; activity vs traction evidence split; resume prompts. |
 | `apply-thread-names.test.mjs` | `[Stage] title` rename is idempotent; manual-Done archives the rollout and drops the index line; auto-Done does NOT archive; cross-machine paths are a safe no-op. |
 | `edit-thread.test.mjs` | `--finish` sets the full archive gate; `--stage` fuzzy-matches; `--note ''` clears. |
 

@@ -10,6 +10,7 @@ and operators who want to understand the moving parts.
 |---|---|
 | `scripts/scan-session-history.mjs` | Scans native harness session history → per-session cards (`threads.<host>.jsonl`). |
 | `scripts/reconcile-threads.mjs` | Clusters cards into a durable thread registry (`active-threads.jsonl` + `active-threads.md`). Fuzzy intent clustering, intent-area tagging, manual-field preservation. |
+| `scripts/extract-goal-network.mjs` | Derives a deterministic goal network (`goal-network.json` + `goal-network.md`) from the active thread registry. |
 | `scripts/apply-thread-names.mjs` | Stamps `[Stage] title` onto Codex session names; archives finished Codex sessions. |
 | `scripts/set-display-titles.mjs` | Loads outcome-framed display titles into the registry from a JSON map. |
 | `scripts/set-next-steps.mjs` | Loads suggested next-step prompts into the registry from a JSON map. |
@@ -33,6 +34,25 @@ correction is never overwritten by a rescan.
 
 `active-threads.md` is the rendered board grouped by stage. `[AGING]`
 marks threads idle past the interim staleness SLE for their stage.
+
+## Goal network
+
+`goal-network.json` and `goal-network.md` are derived artifacts above the
+thread registry. Run:
+
+```bash
+npm run goals
+```
+
+The first implementation is deterministic: it groups included threads by
+`intent_area`, lists child outcomes from each thread's `outcome_intent`,
+separates activity evidence from traction evidence, and generates a
+copy-paste `/goal` prompt per goal. Done/archive threads are omitted by
+default; use `node scripts/extract-goal-network.mjs --include-done` for
+historical or case-study analysis.
+
+The extraction contract, schema, and correction path live in
+[`docs/goal-network-extraction-contract.md`](goal-network-extraction-contract.md).
 
 ## Lifecycle stages
 
@@ -139,3 +159,6 @@ done more than 14 days drop off the board entirely.
   title field).
 - Display-title and next-step generation are out-of-band today; the
   auto-generation pass is planned as a periodic skill.
+- Goal-network extraction is deterministic and coarse. It needs a
+  file-backed correction path for merge/split/rename decisions before a
+  `/goals` UI becomes a source of truth.

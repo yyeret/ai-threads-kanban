@@ -6,8 +6,9 @@ This document tracks planned features, refactoring tasks, and future directions 
 
 ### 1. Goal Network Extraction POC
 - **Goal:** Let Yuval and agents inspect AI thread history as a network of goals, child outcomes, evidence, assumptions, blockers, and next-best actions.
-- **Approach:** Add a static extractor that reads the existing thread registry and produces inspectable Markdown/JSON goal-network artifacts before building UI.
+- **Approach:** Use the static extractor to produce inspectable Markdown/JSON goal-network artifacts before building UI.
 - **Why first:** This tests whether a goal-first view changes prioritization and resume quality without committing to a heavier app architecture.
+- **Next:** Review generated artifacts, then add file-backed goal correction overrides if the deterministic grouping is useful but too coarse.
 
 ### 2. Automated LLM Title & Next Step Generation
 - **Goal:** Move the generation of display titles and next steps from out-of-band scripts into a scheduled, automatic agent/skill run.

@@ -1,7 +1,7 @@
 # Plan: Goal Network POC
 
 Date: 2026-07-10
-Mode: Lightweight SDD with Compound Engineering candidate
+Mode: Compound Engineering
 Source thread: `thread://019f4b1f-90e5-7892-80e1-e35bc6c4c2eb`
 
 ## 1. Outcome-Oriented Goal & Leading Indicators
@@ -98,6 +98,13 @@ First implementation slice:
 - `[MODIFY]` Update `docs/architecture.md` after the extraction contract is proven.
 
 Do not build the `/goals` UI until the static artifact proves useful.
+
+Implementation result:
+
+- `scripts/extract-goal-network.mjs` now generates `goal-network.json` and `goal-network.md`.
+- `npm run goals` generated 9 goal nodes from 111 shared-registry threads.
+- `docs/goal-network-extraction-contract.md` captures the reusable extraction schema, heuristics, and correction path.
+- Next best action is artifact review plus file-backed correction overrides for the large `Other / Unsorted` group before UI work.
 
 ## 8. Suggested `/goal` Loop Prompt
 
