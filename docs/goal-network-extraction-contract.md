@@ -18,6 +18,18 @@ The first pass is deterministic by design. LLM enrichment can improve naming,
 merging, splitting, or evidence summaries later, but it should not be required
 to produce a useful artifact.
 
+## Review And Override Lifecycle
+
+The correction loop is intentionally two-step:
+
+1. An LLM proposes goal corrections in a review artifact.
+2. A human accepts, edits, or rejects those suggestions.
+3. Accepted suggestions are copied into `goal-overrides.json`.
+4. `npm run goals` applies only `goal-overrides.json`.
+
+Do not apply `goal-overrides.proposed.json` automatically. Proposed files are
+review surfaces, not source-of-truth state.
+
 ## Inputs
 
 Primary input:
@@ -57,6 +69,13 @@ The extractor writes both files to the resolved registry directory:
 - `goal-network.json`
 - `goal-network.md`
 
+If present, `goal-overrides.json` in the same directory is applied before
+grouping. A custom path can be supplied:
+
+```bash
+node scripts/extract-goal-network.mjs --overrides path/to/goal-overrides.json
+```
+
 `goal-network.json` schema version `1`:
 
 ```json
@@ -64,6 +83,7 @@ The extractor writes both files to the resolved registry directory:
   "schema_version": 1,
   "generated_at": "ISO-8601 timestamp",
   "source_registry": "path to active-threads.jsonl",
+  "source_overrides": "path to goal-overrides.json or empty string",
   "thread_count": 0,
   "goal_count": 0,
   "goals": []
@@ -118,13 +138,51 @@ Confidence:
 
 When the deterministic network is useful but wrong, correct in this order:
 
-1. Add or adjust `intent_area` or manual notes on the source thread record.
-2. Add repo-local thread state under `docs/agent-memory/threads/<slug>/`.
-3. Add a future override map for goal merge/split/rename decisions.
-4. Only then add LLM enrichment for naming or summarization.
+1. Generate `goal-overrides.proposed.json` and `goal-review-suggestions.md`.
+2. Review the suggestions.
+3. Copy accepted entries into `goal-overrides.json`.
+4. Re-run `npm run goals`.
+5. If the same correction repeats, update source classification or thread-state
+   so the override is no longer needed.
 
 Do not make the UI the correction source of truth until file-backed overrides
 exist and are tested.
+
+## Override Schema
+
+`goal-overrides.json`:
+
+```json
+{
+  "schema_version": 1,
+  "goals": {
+    "goal-id": {
+      "title": "Human-readable outcome title",
+      "outcome_statement": "Outcome statement used in Markdown and resume prompts.",
+      "area": "Display area"
+    }
+  },
+  "thread_overrides": {
+    "thread_id": {
+      "goal_id": "goal-id",
+      "suppress": false,
+      "rationale": "Why this reviewed correction exists."
+    }
+  },
+  "goal_overrides": {
+    "existing-goal-id": {
+      "goal_id": "replacement-goal-id"
+    }
+  }
+}
+```
+
+Supported corrections:
+
+- define a new goal node in `goals`
+- move a thread to a goal with `thread_overrides.<thread_id>.goal_id`
+- suppress non-goal noise with `thread_overrides.<thread_id>.suppress`
+- rename/merge an existing deterministic group with `goal_overrides`
 
 ## Validation Checklist
 
@@ -134,3 +192,5 @@ exist and are tested.
 - Every goal has a resume prompt.
 - Activity and traction evidence are separate arrays.
 - Done/archive threads are omitted by default and included with `--include-done`.
+- Proposed overrides are not applied unless they are copied to
+  `goal-overrides.json`.

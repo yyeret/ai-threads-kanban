@@ -111,3 +111,83 @@ test("omits done and archived threads unless requested", (t) => {
   assert.equal(network.thread_count, 2);
   assert.equal(network.goals[0].supporting_threads.length, 2);
 });
+
+test("applies reviewed goal overrides without mutating source thread registry", (t) => {
+  const ws = makeWorkspace();
+  t.after(() => fs.rmSync(ws.root, { recursive: true, force: true }));
+
+  writeJsonl(path.join(ws.registry, "active-threads.jsonl"), [
+    makeThreadRecord({
+      thread_id: "other001",
+      title: "Assess backlink strength",
+      outcome_intent: "What is our backlink strength and should we improve it?",
+      intent_area: "Other / Unsorted",
+      stage: "Specify",
+      status: "specifying",
+    }),
+    makeThreadRecord({
+      thread_id: "other002",
+      title: "What can we learn from GSC AI visibility",
+      outcome_intent: "Yuval can decide which AI visibility signals matter from Search Console data",
+      intent_area: "Other / Unsorted",
+      stage: "Specify",
+      status: "specifying",
+    }),
+    makeThreadRecord({
+      thread_id: "noise001",
+      title: "/model",
+      outcome_intent: "/model",
+      intent_area: "Other / Unsorted",
+      stage: "Funnel / Triage",
+      status: "triage",
+    }),
+    makeThreadRecord({
+      thread_id: "site001",
+      title: "Improve quick chat copy",
+      outcome_intent: "Visitors can book a casual conversation without feeling sold to",
+      intent_area: "Site & Web",
+      stage: "Implement",
+      status: "active",
+    }),
+  ]);
+
+  fs.writeFileSync(path.join(ws.registry, "goal-overrides.json"), JSON.stringify({
+    schema_version: 1,
+    goals: {
+      "search-visibility": {
+        title: "Yuval can see which search and AI visibility work deserves attention",
+        outcome_statement: "Yuval can decide which search and AI visibility opportunities are worth acting on next.",
+        area: "Search & AI Visibility",
+      },
+      "website-conversion": {
+        title: "Visitors can take the right next step from the website",
+        outcome_statement: "Visitors can understand the next conversation option and take it without sales pressure.",
+      },
+    },
+    thread_overrides: {
+      other001: { goal_id: "search-visibility", rationale: "Backlink strength is search visibility work." },
+      other002: { goal_id: "search-visibility", rationale: "GSC AI visibility belongs with search visibility." },
+      noise001: { suppress: true, rationale: "Slash command noise, not goal work." },
+    },
+    goal_overrides: {
+      "site-web": { goal_id: "website-conversion" },
+    },
+  }, null, 2), "utf8");
+
+  runScript("extract-goal-network.mjs", ws.env);
+
+  const network = JSON.parse(fs.readFileSync(path.join(ws.registry, "goal-network.json"), "utf8"));
+  assert.equal(network.thread_count, 3, "suppressed thread should not count");
+  assert.equal(network.goals.some((g) => g.supporting_threads.some((thread) => thread.thread_id === "noise001")), false);
+
+  const search = network.goals.find((g) => g.id === "search-visibility");
+  assert.ok(search);
+  assert.equal(search.title, "Yuval can see which search and AI visibility work deserves attention");
+  assert.equal(search.supporting_threads.length, 2);
+  assert.deepEqual(search.supporting_threads.map((thread) => thread.thread_id).sort(), ["other001", "other002"]);
+
+  const website = network.goals.find((g) => g.id === "website-conversion");
+  assert.ok(website);
+  assert.equal(website.supporting_threads.length, 1);
+  assert.equal(website.area, "Site & Web");
+});

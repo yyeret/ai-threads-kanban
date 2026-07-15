@@ -12,6 +12,7 @@ const dir = path.resolve(args.dir ? expandHome(args.dir) : resolveRegistryDir())
 const registryPath = path.join(dir, "active-threads.jsonl");
 const jsonPath = path.join(dir, "goal-network.json");
 const mdPath = path.join(dir, "goal-network.md");
+const overridesPath = path.resolve(args.overrides ? expandHome(args.overrides) : path.join(dir, "goal-overrides.json"));
 
 if (!fs.existsSync(registryPath)) {
   console.error(`Thread registry not found: ${registryPath}`);
@@ -19,33 +20,39 @@ if (!fs.existsSync(registryPath)) {
 }
 
 const allThreads = readJsonl(registryPath);
-const threads = allThreads.filter((thread) => args["include-done"] || isLiveThread(thread));
-const network = buildGoalNetwork(threads, { registryPath });
+const overrides = loadOverrides(overridesPath);
+const threads = allThreads
+  .filter((thread) => args["include-done"] || isLiveThread(thread))
+  .filter((thread) => !threadOverrideFor(thread, overrides).suppress);
+const network = buildGoalNetwork(threads, { registryPath, overridesPath: fs.existsSync(overridesPath) ? overridesPath : "", overrides });
 
 fs.writeFileSync(jsonPath, `${JSON.stringify(network, null, 2)}\n`, "utf8");
 fs.writeFileSync(mdPath, renderGoalNetwork(network), "utf8");
 
 console.log(`Extracted ${network.goals.length} goals from ${network.thread_count} threads -> ${jsonPath}`);
 
-export function buildGoalNetwork(threads, { registryPath: sourceRegistry = "" } = {}) {
+export function buildGoalNetwork(threads, { registryPath: sourceRegistry = "", overridesPath: sourceOverrides = "", overrides = emptyOverrides() } = {}) {
   const generatedAt = new Date().toISOString();
-  const groups = groupBy(threads, (thread) => normalizeArea(thread.intent_area));
+  const groups = groupBy(threads, (thread) => goalKeyFor(thread, overrides));
   const goals = [...groups.entries()]
-    .map(([area, items]) => buildGoal(area, items))
+    .map(([goalId, items]) => buildGoal(goalId, items, overrides))
     .sort((a, b) => b.supporting_threads.length - a.supporting_threads.length || a.title.localeCompare(b.title));
 
   return {
     schema_version: 1,
     generated_at: generatedAt,
     source_registry: sourceRegistry,
+    source_overrides: sourceOverrides,
     thread_count: threads.length,
     goal_count: goals.length,
     goals,
   };
 }
 
-function buildGoal(area, threads) {
+function buildGoal(goalId, threads, overrides) {
   const sorted = [...threads].sort(byActivityDesc);
+  const derivedArea = normalizeArea(sorted[0]?.intent_area);
+  const meta = goalMetaFor(goalId, derivedArea, overrides);
   const supportingThreads = sorted.map((thread) => ({
     thread_id: thread.thread_id,
     title: thread.display_title || thread.title || "Untitled thread",
@@ -65,10 +72,10 @@ function buildGoal(area, threads) {
   const blockedThreads = sorted.filter((thread) => thread.blocked || /block|stuck|waiting|hold/i.test(`${thread.where_it_stands} ${thread.notes}`));
 
   const goal = {
-    id: slugify(area),
-    title: `Agents can improve ${area} outcomes`,
-    outcome_statement: `Agents and Yuval can make better decisions about ${area} work by seeing the related threads, evidence, blockers, and next action in one place.`,
-    area,
+    id: meta.id,
+    title: meta.title,
+    outcome_statement: meta.outcome_statement,
+    area: meta.area,
     confidence: confidenceFor(sorted, tractionEvidence),
     supporting_threads: supportingThreads,
     child_outcomes: sorted.map((thread) => ({
@@ -76,7 +83,7 @@ function buildGoal(area, threads) {
       statement: thread.outcome_intent || thread.display_title || thread.title || "Clarify this thread outcome",
       framing: classifyFraming(thread.outcome_intent || thread.title || ""),
     })),
-    assumptions: assumptionsFor(area, sorted),
+    assumptions: assumptionsFor(meta.area, sorted),
     activity_evidence: activityEvidence.map(stripKind),
     traction_evidence: tractionEvidence.map(stripKind),
     blockers: blockedThreads.map((thread) => ({
@@ -162,12 +169,56 @@ function normalizeArea(area) {
   return String(area || "Other / Unsorted").trim() || "Other / Unsorted";
 }
 
+function goalKeyFor(thread, overrides) {
+  const threadOverride = threadOverrideFor(thread, overrides);
+  if (threadOverride.goal_id) return slugify(threadOverride.goal_id);
+  const baseGoalId = slugify(normalizeArea(thread.intent_area));
+  const goalOverride = overrides.goal_overrides[baseGoalId] || {};
+  return slugify(goalOverride.goal_id || baseGoalId);
+}
+
+function goalMetaFor(goalId, derivedArea, overrides) {
+  const meta = overrides.goals[goalId] || {};
+  return {
+    id: goalId,
+    title: meta.title || `Agents can improve ${meta.area || derivedArea} outcomes`,
+    outcome_statement: meta.outcome_statement || `Agents and Yuval can make better decisions about ${meta.area || derivedArea} work by seeing the related threads, evidence, blockers, and next action in one place.`,
+    area: meta.area || derivedArea,
+  };
+}
+
+function threadOverrideFor(thread, overrides) {
+  return overrides.thread_overrides[thread.thread_id] || {};
+}
+
+function loadOverrides(file) {
+  if (!file || !fs.existsSync(file)) return emptyOverrides();
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return {
+      schema_version: parsed.schema_version || 1,
+      goals: parsed.goals && typeof parsed.goals === "object" ? parsed.goals : {},
+      thread_overrides: parsed.thread_overrides && typeof parsed.thread_overrides === "object" ? parsed.thread_overrides : {},
+      goal_overrides: parsed.goal_overrides && typeof parsed.goal_overrides === "object" ? parsed.goal_overrides : {},
+    };
+  } catch (err) {
+    console.error(`Could not parse goal overrides: ${file}`);
+    console.error(err.message);
+    process.exit(1);
+  }
+}
+
+function emptyOverrides() {
+  return { schema_version: 1, goals: {}, thread_overrides: {}, goal_overrides: {} };
+}
+
 function renderGoalNetwork(network) {
   const lines = [
     "# Goal Network",
     "",
     `Generated: ${network.generated_at}`,
     `Source registry: \`${network.source_registry}\``,
+    `Source overrides: ${network.source_overrides ? `\`${network.source_overrides}\`` : "_none_"}`,
     `Threads analyzed: ${network.thread_count}`,
     `Goals: ${network.goal_count}`,
     "",
