@@ -29,6 +29,19 @@ const STAGE_ORDER = [
 ];
 const LIST_ORDER = STAGE_ORDER;
 const MUTED_STAGES = new Set(["Funnel / Triage", "On Hold", "Done / Archive Candidates"]);
+const GOAL_NETWORKS = [
+  "LinkedIn & Prospecting",
+  "CRM & Pipeline Data",
+  "Content & Publishing",
+  "Podcast",
+  "Thought Leadership & POV",
+  "Skill Library & Agent Infra",
+  "Site & Web",
+  "Meetings & Clients",
+  "Job Search",
+  "Sales & Proposals",
+];
+const UNCATEGORIZED_AREAS = new Set(["", "Other", "Other / Unsorted", "Uncategorized", "Uncategorised"]);
 
 // In-memory registry cache — loaded async at startup and on /refresh so
 // request handlers never block on a Drive readFileSync that can stall
@@ -105,6 +118,7 @@ async function rebuildSearchIndex() {
   }
 }
 
+
 async function reloadRegistryCache() {
   try {
     const text = await fs.promises.readFile(registryPath, "utf8");
@@ -133,6 +147,7 @@ const server = http.createServer((req, res) => {
     if (url.pathname === "/card") return handleCard(res, url.searchParams.get("id"));
     if (url.pathname === "/refresh") return handleRefresh(res, url.searchParams);
     if (url.pathname === "/set-stage") return handleSetStage(res, url.searchParams.get("id"), url.searchParams.get("stage"));
+    if (url.pathname === "/set-goal-network") return handleSetGoalNetwork(req, res, url.searchParams);
     res.writeHead(404).end("Not found");
   } catch (err) {
     res.writeHead(500).end(`Error: ${err.message}`);
@@ -221,6 +236,31 @@ function handleSetStage(res, id, stage) {
   }
   reloadRegistryCache(); // async, non-blocking
   res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
+}
+
+function handleSetGoalNetwork(req, res, searchParams) {
+  const id = searchParams.get("id");
+  const network = normalizeGoalNetwork(searchParams.get("network") || searchParams.get("area") || "");
+  if (!id || !network) {
+    return res.writeHead(400).end("bad request");
+  }
+
+  const records = loadRegistry();
+  const t = records.find((r) => r.thread_id === id);
+  if (!t) return res.writeHead(404).end("thread not found");
+
+  t.manual_area = network;
+  t.intent_area = network;
+  t.updated_at = new Date().toISOString();
+  fs.writeFileSync(registryPath, records.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+  reloadRegistryCache(); // async, non-blocking
+
+  const accept = req.headers.accept || "";
+  if (accept.includes("text/html")) {
+    res.writeHead(303, { Location: safeReturnPath(req) }).end();
+  } else {
+    res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
+  }
 }
 
 function handleRefresh(res, searchParams) {
@@ -697,6 +737,38 @@ function areaColor(area) {
   return palette[area] || "#94a3b8";
 }
 
+function effectiveGoalNetwork(t) {
+  return t.intent_area || "Other / Unsorted";
+}
+
+function isUncategorizedGoal(t) {
+  return UNCATEGORIZED_AREAS.has(effectiveGoalNetwork(t));
+}
+
+function normalizeGoalNetwork(value) {
+  const network = String(value || "").replace(/\s+/g, " ").trim();
+  if (!network || network.length > 80) return "";
+  return network;
+}
+
+function renderGoalNetworkOverride(t) {
+  if (t.isSkillMaintenance || !isUncategorizedGoal(t)) return "";
+  const options = GOAL_NETWORKS.map((network) =>
+    `<option value="${esc(network)}">${esc(network)}</option>`
+  ).join("");
+  return `<form class="goal-network" action="/set-goal-network" method="GET">
+      <input type="hidden" name="id" value="${esc(t.thread_id)}">
+      <label>
+        <span>Goal network</span>
+        <select name="network" required>
+          <option value="" selected disabled>Choose...</option>
+          ${options}
+        </select>
+      </label>
+      <button type="submit">Set</button>
+    </form>`;
+}
+
 const LOCAL_MACHINE = os.hostname();
 // Short label for which machine(s) own a thread's sessions. Hide when the
 // only owner is the local machine — that's the common case and not worth
@@ -732,6 +804,7 @@ function renderCard(t) {
   const nextStep = t.next_step
     ? `<div class="nextstep"><span class="ns-label">&#9654; Next step</span> ${esc(t.next_step)}</div>`
     : "";
+  const goalNetworkOverride = renderGoalNetworkOverride(t);
     
   const titleText = isMaint ? `&#128736; ${esc(t.title)}` : esc(t.display_title || t.title);
   
@@ -745,6 +818,7 @@ function renderCard(t) {
       <div class="standing">${esc(t.status || "")} — ${esc(truncate(t.where_it_stands || "", 160))}</div>
       ${t.notes ? `<div class="notes">note: ${esc(t.notes)}</div>` : ""}
       ${nextStep}
+      ${goalNetworkOverride}
       <div class="card-foot">
         <span class="dim">${agePill(t)} ${esc(harness)} · ${esc(t.repo_key || "")}${t.session_count > 1 ? ` · ${t.session_count} sessions` : ""}${machineLabel(t) ? ` · &#128187; ${esc(machineLabel(t))}` : ""}</span>
         <span class="actions">${continueBtn}${logLink}</span>
@@ -972,6 +1046,18 @@ function esc(text) {
   ));
 }
 
+function safeReturnPath(req) {
+  try {
+    const ref = req.headers.referer;
+    if (!ref) return "/kanban";
+    const u = new URL(ref);
+    if (u.hostname !== "127.0.0.1" && u.hostname !== "localhost") return "/kanban";
+    return `${u.pathname}${u.search}`;
+  } catch {
+    return "/kanban";
+  }
+}
+
 function sendHtml(res, html) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(html);
 }
@@ -1058,6 +1144,11 @@ function page(title, body) {
   .nextstep { margin-top: 6px; padding: 5px 8px; background: #eef4ff; border-radius: 6px; font-size: 12px; color: #1e3a5f; }
   .ns-label { font-weight: 700; color: #2563eb; }
   .ns-dot { color: #2563eb; font-size: 9px; }
+  .goal-network { margin-top: 7px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 7px 8px; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 6px; font-size: 12px; color: #7c2d12; }
+  .goal-network label { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .goal-network span { font-weight: 700; }
+  .goal-network select { max-width: 240px; border: 1px solid #fdba74; border-radius: 5px; background: #fff; color: #1a1a2e; font-size: 12px; padding: 3px 6px; }
+  .goal-network button { border: none; border-radius: 5px; background: #ea580c; color: #fff; font-size: 12px; font-weight: 700; padding: 4px 9px; cursor: pointer; }
   .card-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; gap: 10px; flex-wrap: wrap; }
   .dim { color: #889; font-size: 12px; }
   .badge { font-size: 11px; padding: 1px 7px; border-radius: 4px; }
@@ -1157,8 +1248,9 @@ function renderTelemetry(searchParams) {
     const skillsDir = path.join(os.homedir(), "Github", "ai-skill-library", "skills");
     if (fs.existsSync(skillsDir)) {
       fs.readdirSync(skillsDir).forEach((name) => {
-        if (fs.statSync(path.join(skillsDir, name)).isDirectory() && fs.existsSync(path.join(skillsDir, name, "SKILL.md"))) {
-          allKnown.add(name);
+        const entryPath = path.join(skillsDir, name);
+        if (fs.statSync(entryPath).isFile() && name.endsWith(".md")) {
+          allKnown.add(path.basename(name, ".md"));
         }
       });
     }
@@ -1385,4 +1477,3 @@ function renderTelemetry(searchParams) {
   `;
   return page("Skill Telemetry Insights", body);
 }
-
