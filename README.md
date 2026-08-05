@@ -78,6 +78,46 @@ Three compact icons per card:
 | ⏭ | Resume + copy the suggested next-step prompt to clipboard. |
 | 📄 | Render the transcript (head + tail, harness preamble stripped). |
 
+Thread cards also show a goal badge when the generated goal network knows
+which outcome the thread supports. Use the goal chips above the board to
+filter the thread board to one outcome.
+
+**Goals view** (`/goals`) manages the goals themselves as an OKR-style
+Kanban: `Considering/Exploring → Planning/Committing → In Progress →
+Review/Adaptation → Done`. Drag a goal card to update its lifecycle. Goal
+state is written to `goal-overrides.json`, then `goal-network.json` is
+regenerated so agents and the UI read the same source.
+
+**Goal Buckets** (`/goal-threads`) manages which goal each thread supports.
+The view is a two-pane explorer: goals are listed on the left without their
+threads, and the selected goal's current threads appear on the right. Drag a
+thread from the right pane onto a goal in the left pane to write a reviewed
+`thread_overrides.<thread_id>.goal_id` correction and regenerate the goal
+network. When a thread exposes work that does not fit any existing goal, use
+the New goal form in the left pane; manually-created goals are kept visible
+even before they have supporting threads.
+
+Goals can also reference Lean Product Canvas intent documents under
+`docs/goal-intents/`. The weekly goal review uses those canvases to evaluate
+progress indicators and to flag associated threads that may be a weak fit for
+the goal. The `/goals` and `/goal-threads` views link to the canvas when a goal
+has one.
+
+The shared goal loop can also be made available from related workspaces with:
+
+```bash
+npm run goals:link-workspaces
+```
+
+That creates an `agent-goal-loop` symlink in the default business and repo
+workspaces, pointing at the configured registry root where `goal-network.json`,
+`goal-review.md`, `goal-review-state.json`, and `goal-review-history.jsonl`
+live. It also creates an `agent-goal-loop-profile.md` symlink in each workspace
+so the same loop can boot with a different agent identity, focus, and guardrails
+for CRM Ops, AI Transformation Consulting, Marketing Engine, the site, the skill
+library, and this thread-board repo. Pass workspace paths as arguments to link
+additional workspaces.
+
 **Shareable view** (`/kanban-ipsum`) is the same shape with every card
 title replaced by deterministic placeholder text — safe to screenshot.
 

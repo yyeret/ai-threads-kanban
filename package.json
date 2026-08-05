@@ -1,6 +1,6 @@
 {
   "name": "ai-threads-kanban",
-  "version": "0.2.0",
+  "version": "0.3.11",
   "description": "Cross-harness kanban board for in-flight AI work threads across Claude Code, Codex, and Gemini.",
   "private": true,
   "type": "module",
@@ -10,7 +10,10 @@
     "scan": "node scripts/scan-session-history.mjs",
     "reconcile": "node scripts/reconcile-threads.mjs",
     "goals": "node scripts/extract-goal-network.mjs",
-    "refresh": "node scripts/scan-session-history.mjs --days 30 && node scripts/reconcile-threads.mjs && node scripts/apply-thread-names.mjs",
+    "goals:review": "node scripts/review-goal-progress.mjs --refresh",
+    "goals:loop": "node scripts/review-goal-progress.mjs --refresh --notify --watch --interval-days 7",
+    "goals:link-workspaces": "node scripts/link-goal-loop-workspaces.mjs",
+    "refresh": "node scripts/scan-session-history.mjs --days 30 && node scripts/reconcile-threads.mjs && node scripts/extract-goal-network.mjs && node scripts/apply-thread-names.mjs",
     "serve": "node scripts/serve-thread-board.mjs"
   }
 }

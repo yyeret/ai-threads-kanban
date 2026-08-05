@@ -15,6 +15,7 @@ fi
 
 "$NODE" "$DIR/scan-session-history.mjs" --days 30 >/dev/null 2>&1
 "$NODE" "$DIR/reconcile-threads.mjs" >/dev/null 2>&1
+"$NODE" "$DIR/extract-goal-network.mjs" >/dev/null 2>&1
 "$NODE" "$DIR/apply-thread-names.mjs" >/dev/null 2>&1
 
 # Mirror the registry to a local path so the board server (which runs as a
@@ -31,7 +32,9 @@ else if(r){process.stdout.write(r+'/projects/agent-threads');}
 else if(f.existsSync(p)){process.stdout.write(f.readFileSync(p,'utf8').trim());}
 " 2>/dev/null)"
 if [ -n "$REGISTRY_DIR" ] && [ -f "$REGISTRY_DIR/active-threads.jsonl" ]; then
-  cp "$REGISTRY_DIR/active-threads.jsonl" "$LOCAL_BOARD_DIR/active-threads.jsonl" 2>/dev/null || true
+  for f in active-threads.jsonl goal-network.json goal-network.md goal-overrides.json goal-review-state.json goal-review-history.jsonl goal-review.md machines.json; do
+    [ -f "$REGISTRY_DIR/$f" ] && cp "$REGISTRY_DIR/$f" "$LOCAL_BOARD_DIR/$f" 2>/dev/null || true
+  done
 fi
 
 # Mirror the telemetry events file as well so the board server's /telemetry page works
@@ -61,4 +64,3 @@ if [ -n "$TELEMETRY_EVENTS_FILE" ] && [ -f "$TELEMETRY_EVENTS_FILE" ]; then
 fi
 
 exit 0
-

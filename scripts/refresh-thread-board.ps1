@@ -20,10 +20,12 @@ try {
 
     $scan = Join-Path $scriptDir 'scan-session-history.mjs'
     $reconcile = Join-Path $scriptDir 'reconcile-threads.mjs'
+    $extractGoals = Join-Path $scriptDir 'extract-goal-network.mjs'
     $applyNames = Join-Path $scriptDir 'apply-thread-names.mjs'
 
     & $node $scan --days 30 *> $null
     & $node $reconcile *> $null
+    & $node $extractGoals *> $null
     # Stamp "[Stage] title" onto Codex session names so the picker shows them.
     & $node $applyNames *> $null
 }

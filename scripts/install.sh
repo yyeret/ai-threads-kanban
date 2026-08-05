@@ -223,11 +223,12 @@ if [[ -z "$NODE" ]]; then
 fi
 "$NODE" "$REPO_ROOT/scripts/scan-session-history.mjs" --days 30 >/dev/null
 "$NODE" "$REPO_ROOT/scripts/reconcile-threads.mjs" >/dev/null
+"$NODE" "$REPO_ROOT/scripts/extract-goal-network.mjs" >/dev/null
 
 # 5. LaunchAgent (macOS only — Linux users can run serve-thread-board.mjs
 #    via systemd or directly; we don't auto-install that yet).
 if [[ "$INSTALL_SERVER" -eq 1 ]] && [[ "$(uname)" == "Darwin" ]]; then
-  "$REPO_ROOT/scripts/install-thread-board-launchagent.sh" --port "$PORT"
+  "$REPO_ROOT/scripts/install-thread-board-launchagent.sh" --port "$PORT" --registry-root "$REGISTRY_ROOT"
 elif [[ "$INSTALL_SERVER" -eq 1 ]]; then
   echo
   echo "To run the board server, start it manually:"

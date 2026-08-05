@@ -54,6 +54,34 @@ historical or case-study analysis.
 The extraction contract, schema, and correction path live in
 [`docs/goal-network-extraction-contract.md`](goal-network-extraction-contract.md).
 
+The web board reads `goal-network.json` as a derived management layer. Thread
+cards display goal badges and the list/Kanban thread views can filter by goal
+without mutating `active-threads.jsonl`.
+
+The `/goals` board manages goal lifecycle state using an OKR Kanban flow:
+`Considering / Exploring → Planning / Committing → In Progress →
+Review / Adaptation → Done`. Dragging a goal writes
+`goals.<goal_id>.lifecycle_stage` to `goal-overrides.json` and regenerates the
+goal network. Traction status is red by default and moves to yellow/green from
+evidence unless a reviewed override sets `traction_status`.
+
+The `/goal-threads` explorer manages thread-to-goal assignment. It renders the
+goal list in a left pane, shows only the selected goal's current threads in the
+right pane, and lets a reviewed drag/drop write
+`thread_overrides.<thread_id>.goal_id` to `goal-overrides.json`. The server
+immediately regenerates `goal-network.json` so badges, filters, and the
+explorer converge on the same reviewed state. The left pane also exposes a
+manual goal form; `/create-goal` writes `goals.<goal_id>` to
+`goal-overrides.json`, and the extractor keeps those manually-defined goals
+visible even before a supporting thread is moved into them.
+
+Goal intent canvases live in `docs/goal-intents/<goal-id>.md`. A goal can
+reference one through `goals.<goal_id>.intent_canvas_ref`; the weekly review
+also falls back to that file naming convention. The canvas provides key
+results, leading indicators, fit signals, anti-fit signals, and straying
+questions that the weekly loop uses to evaluate progress and challenge whether
+associated threads still belong with the goal.
+
 ## Lifecycle stages
 
 Left-to-right flow: `Funnel / Triage → On Hold → Specify → Plan →
@@ -133,6 +161,9 @@ done more than 14 days drop off the board entirely.
 
 - `/` — list view (stages collapsed, Done collapsed by default).
 - `/kanban` — kanban view, HTML5 drag-and-drop.
+- `/goals` — goal lifecycle Kanban, HTML5 drag-and-drop.
+- `/goal-threads` — two-pane goal/thread explorer for moving threads between
+  goals, HTML5 drag-and-drop.
 - `/kanban-ipsum` — same shape, deterministic placeholder titles.
 - `/continue?id=<thread_id>&step=1` — opens the session's working dir
   in a terminal, runs its resume command, optionally copies the next-step.
@@ -141,6 +172,12 @@ done more than 14 days drop off the board entirely.
 - `/set-stage?id=<thread_id>&stage=<name>` — drag-drop endpoint;
   writes `manual_stage`, also flips `manual_status` to `done` when
   dropped on Done.
+- `/set-goal-stage?id=<goal_id>&stage=<name>` — goal drag-drop endpoint;
+  writes reviewed lifecycle state to `goal-overrides.json` and regenerates
+  `goal-network.json`.
+- `/set-thread-goal?id=<thread_id>&goal=<goal_id>` — thread-to-goal drag-drop
+  endpoint; writes a reviewed goal override for the thread and regenerates
+  `goal-network.json`.
 - `/refresh` — re-runs scan + reconcile.
 - `/card?id=<thread_id>` — modal detail.
 

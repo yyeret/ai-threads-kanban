@@ -34,6 +34,12 @@ console.log(`Extracted ${network.goals.length} goals from ${network.thread_count
 export function buildGoalNetwork(threads, { registryPath: sourceRegistry = "", overridesPath: sourceOverrides = "", overrides = emptyOverrides() } = {}) {
   const generatedAt = new Date().toISOString();
   const groups = groupBy(threads, (thread) => goalKeyFor(thread, overrides));
+  const aliasedGoalIds = new Set(Object.keys(overrides.goal_overrides || {}).map(slugify));
+  for (const goalId of Object.keys(overrides.goals || {})) {
+    const normalized = slugify(goalId);
+    if (aliasedGoalIds.has(normalized)) continue;
+    if (!groups.has(normalized)) groups.set(normalized, []);
+  }
   const goals = [...groups.entries()]
     .map(([goalId, items]) => buildGoal(goalId, items, overrides))
     .sort((a, b) => b.supporting_threads.length - a.supporting_threads.length || a.title.localeCompare(b.title));
@@ -60,6 +66,7 @@ function buildGoal(goalId, threads, overrides) {
     stage: thread.stage || "",
     status: thread.status || "",
     repo_key: thread.repo_key || "",
+    session_cwd: thread.sessions?.[0]?.cwd || "",
     last_activity: thread.last_activity || "",
     next_step: thread.next_step || "",
     resume: thread.sessions?.[0]?.resume || "",
@@ -76,7 +83,16 @@ function buildGoal(goalId, threads, overrides) {
     title: meta.title,
     outcome_statement: meta.outcome_statement,
     area: meta.area,
+    lifecycle_stage: meta.lifecycle_stage,
+    intent_canvas_ref: meta.intent_canvas_ref,
+    key_results: meta.key_results,
+    leading_indicators: meta.leading_indicators,
+    fit_signals: meta.fit_signals,
+    anti_fit_signals: meta.anti_fit_signals,
+    straying_questions: meta.straying_questions,
+    agent_role_refs: meta.agent_role_refs,
     confidence: confidenceFor(sorted, tractionEvidence),
+    traction_status: meta.traction_status || tractionStatusFor(sorted, tractionEvidence),
     supporting_threads: supportingThreads,
     child_outcomes: sorted.map((thread) => ({
       thread_id: thread.thread_id,
@@ -153,6 +169,12 @@ function confidenceFor(threads, tractionEvidence) {
   return "low";
 }
 
+function tractionStatusFor(threads, tractionEvidence) {
+  if (tractionEvidence.length >= 2 && threads.length >= 3) return "green";
+  if (tractionEvidence.length >= 1) return "yellow";
+  return "red";
+}
+
 function isLiveThread(thread) {
   if (thread.stage === "Done / Archive Candidates") return false;
   if (thread.tracking_decision === "archive") return false;
@@ -171,10 +193,60 @@ function normalizeArea(area) {
 
 function goalKeyFor(thread, overrides) {
   const threadOverride = threadOverrideFor(thread, overrides);
-  if (threadOverride.goal_id) return slugify(threadOverride.goal_id);
+  if (threadOverride.goal_id) {
+    const overrideGoalId = slugify(threadOverride.goal_id);
+    const targetOverride = overrides.goal_overrides[overrideGoalId] || {};
+    return slugify(targetOverride.goal_id || overrideGoalId);
+  }
+  const folderGoalId = folderGoalForThread(thread);
+  if (folderGoalId && overrides.goals[folderGoalId]) return folderGoalId;
   const baseGoalId = slugify(normalizeArea(thread.intent_area));
   const goalOverride = overrides.goal_overrides[baseGoalId] || {};
   return slugify(goalOverride.goal_id || baseGoalId);
+}
+
+function folderGoalForThread(thread) {
+  const haystack = [
+    thread.repo_key,
+    thread.sessions?.[0]?.cwd,
+    thread.sessions?.[0]?.transcript_path,
+    thread.title,
+    thread.display_title,
+    thread.outcome_intent,
+    thread.where_it_stands,
+    thread.next_step,
+  ].join(" ").toLowerCase();
+
+  const aiNativeDeliveryContent = /(customizing safe|safe.*spec-driven|spec-driven thing|spec-driven.*(ai development|ai-native|ai native|delivery)|ai-native guidance|ai native guidance|guidance layers?|engineering to adoption|adoption bottleneck|operating model mismatch|ai value realization|ai theater)/.test(haystack);
+  const siteContentWorkflow = /(c-sdd|content-sdd|content-drafts|backlog[\\/]+content-drafts|article|blog|post|insight|content|copy|draft|category)/.test(haystack);
+
+  if (aiNativeDeliveryContent) {
+    return "ai-native-delivery-systems";
+  }
+  if (/(ai-threads-kanban|ai-skill-library|agent-memory|skill-library)/.test(haystack)) {
+    return "internal-ai-operating-system";
+  }
+  if (/(post effectiveness|topic performance|linkedin analytics|gsc|backlink|search console|seo|aeo|content graph|buffer|rss|syndicat|podcast)/.test(haystack)) {
+    return "marketing-discoverability";
+  }
+  if (/(crm ops|sales|proposal|pipeline|mini crm|customers\/|customer relationship)/.test(haystack)) {
+    return "revenue-pipeline-outreach";
+  }
+  if (/(seeking full-time roles|job search|auto-apply|application package|career)/.test(haystack)) {
+    return "personal-life-admin";
+  }
+  if (/(marketing engine|linkedin|analytics)/.test(haystack)) {
+    return "marketing-discoverability";
+  }
+  if (/yeret-agility-site/.test(haystack)) {
+    if (siteContentWorkflow || /(rss|syndicat|seo|aeo)/.test(haystack)) return "marketing-discoverability";
+    return "website-developer";
+  }
+  if (/(ai transformation consulting|ai transformation|ai value realization|ai theater|delivery system|operating model mismatch)/.test(haystack)) {
+    if (/(positioning|pov|point of view|thought leadership|talk|abstract|thesis|narrative)/.test(haystack)) return "gtm-strategy-positioning";
+    return "ai-native-delivery-systems";
+  }
+  return "";
 }
 
 function goalMetaFor(goalId, derivedArea, overrides) {
@@ -184,7 +256,22 @@ function goalMetaFor(goalId, derivedArea, overrides) {
     title: meta.title || `Agents can improve ${meta.area || derivedArea} outcomes`,
     outcome_statement: meta.outcome_statement || `Agents and Yuval can make better decisions about ${meta.area || derivedArea} work by seeing the related threads, evidence, blockers, and next action in one place.`,
     area: meta.area || derivedArea,
+    lifecycle_stage: meta.lifecycle_stage || lifecycleStageForGoal(goalId, overrides),
+    intent_canvas_ref: meta.intent_canvas_ref || "",
+    key_results: Array.isArray(meta.key_results) ? meta.key_results : [],
+    leading_indicators: Array.isArray(meta.leading_indicators) ? meta.leading_indicators : [],
+    fit_signals: Array.isArray(meta.fit_signals) ? meta.fit_signals : [],
+    anti_fit_signals: Array.isArray(meta.anti_fit_signals) ? meta.anti_fit_signals : [],
+    straying_questions: Array.isArray(meta.straying_questions) ? meta.straying_questions : [],
+    agent_role_refs: Array.isArray(meta.agent_role_refs) ? meta.agent_role_refs : [],
+    traction_status: meta.traction_status || "",
   };
+}
+
+function lifecycleStageForGoal(goalId, overrides) {
+  const meta = overrides.goals[goalId] || {};
+  if (meta.lifecycle_stage) return meta.lifecycle_stage;
+  return "Considering / Exploring";
 }
 
 function threadOverrideFor(thread, overrides) {
@@ -229,8 +316,21 @@ function renderGoalNetwork(network) {
     lines.push(goal.outcome_statement, "");
     lines.push(`- Goal ID: \`${goal.id}\``);
     lines.push(`- Area: ${escapeMd(goal.area)}`);
+    lines.push(`- Lifecycle: ${escapeMd(goal.lifecycle_stage)}`);
+    lines.push(`- Traction: ${escapeMd(goal.traction_status)}`);
+    if (goal.intent_canvas_ref) lines.push(`- Intent canvas: \`${goal.intent_canvas_ref}\``);
+    if (goal.agent_role_refs.length) lines.push(`- Agent roles: ${goal.agent_role_refs.map((role) => `\`${role}\``).join(", ")}`);
     lines.push(`- Confidence: ${goal.confidence}`);
     lines.push(`- Supporting threads: ${goal.supporting_threads.map((thread) => `\`${thread.thread_id}\``).join(", ")}`);
+    lines.push("");
+
+    lines.push("### Key results / leading indicators", "");
+    if (goal.key_results.length || goal.leading_indicators.length) {
+      for (const result of goal.key_results) lines.push(`- KR: ${escapeMd(result)}`);
+      for (const indicator of goal.leading_indicators) lines.push(`- Leading: ${escapeMd(indicator)}`);
+    } else {
+      lines.push("- None defined yet.");
+    }
     lines.push("");
 
     lines.push("### Child outcomes", "");
