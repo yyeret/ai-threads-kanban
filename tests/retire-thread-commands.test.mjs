@@ -14,7 +14,10 @@ test('retirement preserves customized commands and backs up generated commands a
     const target = path.join(home, directory, 'thread-state' + extension);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     const source = fs.readFileSync(new URL('../skills/thread-state/commands/' + template, import.meta.url), 'utf8');
-    fs.writeFileSync(target, source.replaceAll('\r\n', '\n').replaceAll('{{REPO_ROOT}}', 'C:\\Old workspace\\thread board').replaceAll('\n', '\r\n'));
+    if (template.endsWith('.md')) assert.match(source, /\u2014/);
+    fs.writeFileSync(target, source.replaceAll('\r\n', '\n')
+      .replaceAll('\u2014', '\u00e2\u20ac\u201d').replaceAll('\u00b7', '\u00c2\u00b7')
+      .replaceAll('{{REPO_ROOT}}', 'C:\\Old workspace\\thread board').replaceAll('\n', '\r\n'));
     generated.push(target);
   }
   const custom = path.join(home, '.claude/commands/finish-thread.md');
