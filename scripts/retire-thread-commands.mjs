@@ -7,7 +7,11 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const names = ['thread-state', 'finish-thread', 'track-thread'];
 const targets = [['.claude/commands', 'claude.md', '.md'],
   ['.codex/prompts', 'codex.md', '.md'], ['.gemini/commands', 'gemini.toml', '.toml']];
-const normalize = (text) => text.replaceAll('\r\n', '\n').trim();
+// Older PowerShell installs decoded UTF-8 templates as Windows-1252.
+// Repair only those known punctuation sequences; wording must still match.
+const normalize = (text) => text.replaceAll('\r\n', '\n')
+  .replaceAll('\u00e2\u20ac\u201d', '\u2014')
+  .replaceAll('\u00c2\u00b7', '\u00b7').trim();
 const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export function retireThreadCommands(home = os.homedir()) {
