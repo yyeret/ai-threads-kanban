@@ -2,8 +2,7 @@
 # Install the AI Thread Board on macOS / Linux.
 #
 #   1. Resolve a registry root and persist it.
-#   2. Render slash-command templates with this repo's path and copy them
-#      into each detected harness (Claude / Codex / Gemini).
+#   2. Back up and retire generated legacy thread commands.
 #   3. Wire scripts/refresh-thread-board.sh into each harness's Stop hook
 #      (Codex auto-wired; Claude/Gemini get a TODO if their settings file
 #      already exists — they need a hand-merge).
@@ -11,7 +10,7 @@
 #   5. Optionally install the board server as a launchd LaunchAgent so it
 #      starts on login (skipped with --no-server).
 #
-# Idempotent — re-running updates the slash commands to the current repo path.
+# Idempotent — customized command files are preserved.
 #
 # Usage:
 #   scripts/install.sh                          # default install
@@ -164,30 +163,10 @@ fi
 
 echo "Logged installation to deployments.jsonl and machines.json"
 
-# 2. Slash commands — render {{REPO_ROOT}} and copy into each harness.
-render() {
-  sed "s#{{REPO_ROOT}}#${REPO_ROOT}#g" "$1"
-}
-
-install_skill() {
-  local skill="$1"
-  local src_dir="$REPO_ROOT/skills/$skill/commands"
-  if [[ -d "$HOME/.claude/commands" ]] && [[ -f "$src_dir/claude.md" ]]; then
-    render "$src_dir/claude.md" > "$HOME/.claude/commands/$skill.md"
-    echo "  claude: $skill"
-  fi
-  if [[ -d "$HOME/.codex/prompts" ]] && [[ -f "$src_dir/codex.md" ]]; then
-    render "$src_dir/codex.md" > "$HOME/.codex/prompts/$skill.md"
-    echo "  codex: $skill"
-  fi
-  if [[ -d "$HOME/.gemini/commands" ]] && [[ -f "$src_dir/gemini.toml" ]]; then
-    render "$src_dir/gemini.toml" > "$HOME/.gemini/commands/$skill.toml"
-    echo "  gemini: $skill"
-  fi
-}
-
-echo "Installing slash commands:"
-for skill in thread-state finish-thread track-thread; do install_skill "$skill"; done
+# 2. Retire generated legacy thread commands.
+if [[ -n "$NODE_BIN" ]]; then
+  "$NODE_BIN" "$REPO_ROOT/scripts/retire-thread-commands.mjs"
+fi
 
 # 3. Stop-hook wiring. Codex hooks.json is small enough to template; Claude
 #    and Gemini settings.json are larger user-owned files — we print a TODO

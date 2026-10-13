@@ -1,6 +1,6 @@
 {
   "name": "ai-threads-kanban",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "description": "Cross-harness kanban board for in-flight AI work threads across Claude Code, Codex, and Gemini.",
   "private": true,
   "type": "module",

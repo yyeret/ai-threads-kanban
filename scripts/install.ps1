@@ -1,8 +1,7 @@
 # Install the AI Thread Board on Windows.
 #
 #   1. Resolve a registry root and persist it to %USERPROFILE%\.config\ai-threads-kanban\registry-root.
-#   2. Render slash-command templates with this repo's path and copy them
-#      into each detected harness (Claude / Codex / Gemini).
+#   2. Back up and retire generated legacy thread commands.
 #   3. Wire scripts\refresh-thread-board.ps1 into each harness's Stop hook
 #      (Codex auto-wired; Claude/Gemini get a TODO if their settings file
 #      already exists — they need a hand-merge).
@@ -10,7 +9,7 @@
 #   5. Optionally install the board server as a Scheduled Task at logon
 #      (skipped with -NoServer).
 #
-# Idempotent — re-running updates the slash commands to the current repo path.
+# Idempotent — customized command files are preserved.
 #
 # Usage:
 #   pwsh scripts\install.ps1
@@ -121,25 +120,10 @@ $MachinesMap[$MachineName] = @{
 ConvertTo-Json -InputObject $MachinesMap -Depth 5 | Set-Content -Path $MachinesPath -Encoding utf8
 Write-Host "Logged installation to deployments.jsonl and machines.json"
 
-# 2. Slash commands.
-function Install-Skill {
-  param([string]$Skill)
-  $srcDir = Join-Path $RepoRoot "skills\$Skill\commands"
-  $targets = @(
-    @{ Dir = Join-Path $Home ".claude\commands"; File = "claude.md";  Out = "$Skill.md" },
-    @{ Dir = Join-Path $Home ".codex\prompts";   File = "codex.md";   Out = "$Skill.md" },
-    @{ Dir = Join-Path $Home ".gemini\commands"; File = "gemini.toml";Out = "$Skill.toml" }
-  )
-  foreach ($t in $targets) {
-    if ((Test-Path $t.Dir) -and (Test-Path (Join-Path $srcDir $t.File))) {
-      $content = (Get-Content -Raw (Join-Path $srcDir $t.File)).Replace("{{REPO_ROOT}}", $RepoRoot.Replace("\","\\"))
-      Set-Content -Path (Join-Path $t.Dir $t.Out) -Value $content -Encoding utf8
-      Write-Host "  $($t.Dir | Split-Path -Leaf): $Skill"
-    }
-  }
-}
-Write-Host "Installing slash commands:"
-foreach ($s in @("thread-state","finish-thread","track-thread")) { Install-Skill $s }
+# 2. Retire generated legacy thread commands.
+$Node = Resolve-Node
+& $Node (Join-Path $RepoRoot "scripts\retire-thread-commands.mjs")
+if ($LASTEXITCODE -ne 0) { throw "Thread command retirement failed" }
 
 # 3. Stop-hook wiring.
 $Refresh = Join-Path $RepoRoot "scripts\refresh-thread-board.ps1"
